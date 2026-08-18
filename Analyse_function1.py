@@ -1,377 +1,2446 @@
-import xml.etree.ElementTree as ET
-from pprint import pprint
-from datetime import datetime, time
-import csv
+"""
+scraping_brvm_aiven_24h.py
+==========================
+
+Collecte BRVM -> Aiven for MySQL (defaultdb) sur Render.
+
+Fonctionnement :
+1. Ouvre Chrome en mode headless.
+2. Se connecte au site SGI.
+3. Intercepte les réponses Network contenant "MarketDetails.aspx".
+4. Utilise traiter_bloc_xml() depuis Analyse_function1.py.
+5. Enregistre DIRECTEMENT les données dans Aiven for MySQL.
+6. Chaque champ simple du dictionnaire possède sa propre colonne SQL.
+7. carnet_ordres reste en JSON.
+8. Le premier ID est configuré à 99000000000.
+9. La connexion Aiven est persistante et se reconnecte automatiquement.
+10. La collecte est autorisée uniquement du lundi au vendredi, de 10h00 à 16h30.
+11. Les horaires sont évalués dans le fuseau COLLECT_TIMEZONE (par défaut Africa/Porto-Novo).
+12. Hors créneau, Selenium n'est pas lancé et aucune donnée de marché n'est écrite.
+13. Un mini serveur HTTP /health est lancé pour que le script puisse être déployé comme Web Service Render.
+14. Le script redémarre sa session Selenium après une erreur.
+15. La taille de defaultdb est contrôlée périodiquement.
+16. Lorsque le seuil configuré est atteint, le programme s'arrête avec le code 99.
+
+Dépendances :
+    pip install selenium pymysql python-dotenv cryptography
+
+Fichiers attendus dans le même dossier :
+    scraping_brvm_aiven_24h.py
+    Analyse_function1.py
+    .env
+    ca.pem
+
+IMPORTANT :
+    - Ce script N'UTILISE PAS Collecte_data_BRVM().
+    - Il utilise seulement traiter_bloc_xml().
+"""
+
+import base64
+import copy
+import json
+import logging
+import math
+import os
+import re
+import sys
+import threading
+import time as time_module
+
+from collections import deque
+from datetime import datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pymysql
+from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    WebDriverException,
+    TimeoutException,
+)
+
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+from Analyse_function1 import *
 
 
-# --- Fonctions d'aide pour le parsing (inchangées) ---
-def _try_parse_float(valeur_str):
-    if valeur_str is None or valeur_str == '' or valeur_str == '0': return None
+# ============================================================
+# 1. DOSSIERS ET .ENV
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE)
+
+
+# ============================================================
+# 2. CONFIGURATION SGI
+# ============================================================
+
+SGI_BASE_URL = os.getenv(
+    "SGI_BASE_URL",
+    "https://myaccount.sgibenin.com/index.html",
+).strip()
+
+SGI_LOGIN = os.getenv("SGI_LOGIN", "").strip()
+SGI_PASSWORD = os.getenv("SGI_PASSWORD", "")
+
+
+# ============================================================
+# 3. CONFIGURATION AIVEN
+# ============================================================
+
+AIVEN_MYSQL_HOST = os.getenv(
+    "AIVEN_MYSQL_HOST",
+    "",
+).strip()
+
+AIVEN_MYSQL_PORT = os.getenv(
+    "AIVEN_MYSQL_PORT",
+    "",
+).strip()
+
+AIVEN_MYSQL_USER = os.getenv(
+    "AIVEN_MYSQL_USER",
+    "",
+).strip()
+
+AIVEN_MYSQL_PASSWORD = os.getenv(
+    "AIVEN_MYSQL_PASSWORD",
+    "",
+)
+
+AIVEN_MYSQL_DATABASE = os.getenv(
+    "AIVEN_MYSQL_DATABASE",
+    "defaultdb",
+).strip() or "defaultdb"
+
+AIVEN_CA_CERT = os.getenv(
+    "AIVEN_CA_CERT",
+    "ca.pem",
+).strip()
+
+AIVEN_MYSQL_TABLE = os.getenv(
+    "AIVEN_MYSQL_TABLE",
+    "brvm_market_data",
+).strip()
+
+AIVEN_FIRST_ID = int(
+    os.getenv(
+        "AIVEN_FIRST_ID",
+        "99000000000",
+    )
+)
+
+
+# ============================================================
+# 4. HORAIRES DE COLLECTE
+# ============================================================
+
+# Render utilise souvent UTC côté serveur. On ne dépend donc jamais
+# de l'heure locale de la machine Render.
+COLLECT_TIMEZONE_NAME = os.getenv(
+    "COLLECT_TIMEZONE",
+    "Africa/Porto-Novo",
+).strip()
+
+COLLECT_TIMEZONE = ZoneInfo(
+    COLLECT_TIMEZONE_NAME
+)
+
+COLLECT_START_HOUR = int(
+    os.getenv("COLLECT_START_HOUR", "10")
+)
+
+COLLECT_START_MINUTE = int(
+    os.getenv("COLLECT_START_MINUTE", "0")
+)
+
+COLLECT_END_HOUR = int(
+    os.getenv("COLLECT_END_HOUR", "16")
+)
+
+COLLECT_END_MINUTE = int(
+    os.getenv("COLLECT_END_MINUTE", "30")
+)
+
+COLLECT_START_TIME = time(
+    COLLECT_START_HOUR,
+    COLLECT_START_MINUTE,
+)
+
+COLLECT_END_TIME = time(
+    COLLECT_END_HOUR,
+    COLLECT_END_MINUTE,
+)
+
+# Délai de vérification hors marché.
+OUTSIDE_WINDOW_CHECK_SECONDS = int(
+    os.getenv(
+        "OUTSIDE_WINDOW_CHECK_SECONDS",
+        "60",
+    )
+)
+
+
+# ============================================================
+# 5. PARAMÈTRES DE FONCTIONNEMENT
+# ============================================================
+
+CHROME_HEADLESS = (
+    os.getenv(
+        "CHROME_HEADLESS",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+RESTART_DELAY_SECONDS = int(
+    os.getenv(
+        "RESTART_DELAY_SECONDS",
+        "30",
+    )
+)
+
+LOOP_SLEEP_SECONDS = float(
+    os.getenv(
+        "LOOP_SLEEP_SECONDS",
+        "0.25",
+    )
+)
+
+DB_CONNECT_TIMEOUT = int(
+    os.getenv(
+        "DB_CONNECT_TIMEOUT",
+        "10",
+    )
+)
+
+DB_READ_TIMEOUT = int(
+    os.getenv(
+        "DB_READ_TIMEOUT",
+        "30",
+    )
+)
+
+DB_WRITE_TIMEOUT = int(
+    os.getenv(
+        "DB_WRITE_TIMEOUT",
+        "30",
+    )
+)
+
+# Seuil de sécurité configurable.
+# Ce contrôle mesure la taille logique tables + index de defaultdb.
+AIVEN_MAX_STORAGE_MB = float(
+    os.getenv(
+        "AIVEN_MAX_STORAGE_MB",
+        "950",
+    )
+)
+
+STORAGE_CHECK_INTERVAL_SECONDS = int(
+    os.getenv(
+        "STORAGE_CHECK_INTERVAL_SECONDS",
+        "300",
+    )
+)
+
+
+# Nombre maximal d'entrées historiques conservées en mémoire
+# par instrument. Cela évite une croissance RAM illimitée en 24/7.
+MAX_HISTORY_PER_INSTRUMENT = int(
+    os.getenv(
+        "MAX_HISTORY_PER_INSTRUMENT",
+        "200",
+    )
+)
+
+# Nombre maximal de réponses brutes conservées en RAM.
+MAX_RAW_RESPONSES_IN_MEMORY = int(
+    os.getenv(
+        "MAX_RAW_RESPONSES_IN_MEMORY",
+        "500",
+    )
+)
+
+
+
+# ============================================================
+# 6. LOGS
+# ============================================================
+
+LOG_FILE = BASE_DIR / "collecte_brvm.log"
+
+logger = logging.getLogger("BRVM_AIVEN_24H")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s"
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+# ============================================================
+# 7. EXCEPTION SPÉCIALE POUR LA LIMITE DE STOCKAGE
+# ============================================================
+
+class StorageLimitReached(RuntimeError):
+    pass
+
+
+
+# ============================================================
+# 8. VALIDATION DE LA CONFIGURATION
+# ============================================================
+
+def verifier_configuration():
+    manquants = []
+
+    if not SGI_LOGIN:
+        manquants.append("SGI_LOGIN")
+
+    if not SGI_PASSWORD:
+        manquants.append("SGI_PASSWORD")
+
+    if not AIVEN_MYSQL_HOST:
+        manquants.append("AIVEN_MYSQL_HOST")
+
+    if not AIVEN_MYSQL_PORT:
+        manquants.append("AIVEN_MYSQL_PORT")
+
+    if not AIVEN_MYSQL_USER:
+        manquants.append("AIVEN_MYSQL_USER")
+
+    if not AIVEN_MYSQL_PASSWORD:
+        manquants.append("AIVEN_MYSQL_PASSWORD")
+
+    if manquants:
+        raise RuntimeError(
+            "Paramètres manquants dans .env : "
+            + ", ".join(manquants)
+        )
+
+    if "://" in AIVEN_MYSQL_HOST:
+        raise RuntimeError(
+            "AIVEN_MYSQL_HOST doit contenir uniquement le hostname, "
+            "pas l'URI mysql:// complète."
+        )
+
     try:
-        valeur_nettoyee = valeur_str.replace(' ', '').replace(',', '.')
-        return float(valeur_nettoyee)
-    except (ValueError, TypeError): return None
+        port = int(AIVEN_MYSQL_PORT)
+    except ValueError as exc:
+        raise RuntimeError(
+            "AIVEN_MYSQL_PORT doit être un entier."
+        ) from exc
 
-def _try_parse_int(valeur_str):
-    if valeur_str is None or valeur_str == '' or valeur_str == '0': return None
+    if not (1 <= port <= 65535):
+        raise RuntimeError(
+            "AIVEN_MYSQL_PORT est hors plage."
+        )
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9_]+",
+        AIVEN_MYSQL_TABLE,
+    ):
+        raise RuntimeError(
+            "AIVEN_MYSQL_TABLE doit contenir uniquement "
+            "lettres, chiffres et underscores."
+        )
+
+    if AIVEN_FIRST_ID < 1:
+        raise RuntimeError(
+            "AIVEN_FIRST_ID doit être supérieur à 0."
+        )
+
+    if AIVEN_MAX_STORAGE_MB <= 0:
+        raise RuntimeError(
+            "AIVEN_MAX_STORAGE_MB doit être supérieur à 0."
+        )
+
+    if not (
+        0 <= COLLECT_START_HOUR <= 23
+        and 0 <= COLLECT_END_HOUR <= 23
+        and 0 <= COLLECT_START_MINUTE <= 59
+        and 0 <= COLLECT_END_MINUTE <= 59
+    ):
+        raise RuntimeError(
+            "Les horaires de collecte sont invalides."
+        )
+
+    if COLLECT_START_TIME >= COLLECT_END_TIME:
+        raise RuntimeError(
+            "L'heure de début doit être antérieure à l'heure de fin."
+        )
+
+    if OUTSIDE_WINDOW_CHECK_SECONDS < 5:
+        raise RuntimeError(
+            "OUTSIDE_WINDOW_CHECK_SECONDS doit être >= 5."
+        )
+
+    if AIVEN_CA_CERT:
+        ca_path = Path(AIVEN_CA_CERT).expanduser()
+
+        if not ca_path.is_absolute():
+            ca_path = BASE_DIR / ca_path
+
+        if not ca_path.exists():
+            raise RuntimeError(
+                f"Certificat CA introuvable : {ca_path}"
+            )
+
+
+# ============================================================
+# 9. CONVERSIONS DE DONNÉES
+# ============================================================
+
+def convertir_decimal(value):
+    if value is None:
+        return None
+
+    if isinstance(value, Decimal):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    if text.lower() in {
+        "none",
+        "null",
+        "nan",
+        "n/a",
+        "na",
+    }:
+        return None
+
+    text = (
+        text
+        .replace("\u00a0", "")
+        .replace(" ", "")
+        .replace("%", "")
+        .replace(",", ".")
+    )
+
     try:
-        valeur_nettoyee = valeur_str.replace(' ', '')
-        return int(valeur_nettoyee)
-    except (ValueError, TypeError): return None
+        return Decimal(text)
 
-def _parse_prix_achat_vente(valeur_str):
-    if valeur_str is None or valeur_str == '': return None
-    valeur_str = valeur_str.strip()
-    if valeur_str == '0': return None
-    if valeur_str.upper() in ['A', 'O', 'MARCHÉ', 'MARCHE']: return valeur_str.upper()
-    return _try_parse_float(valeur_str)
+    except InvalidOperation:
+        logger.warning(
+            "Valeur décimale non convertible : %r",
+            value,
+        )
+        return None
 
-def _get_champ(champs, index, defaut=''):
-    try:
-        return champs[index].strip() if champs[index] is not None else defaut
-    except IndexError: return defaut
 
-# --- Fonction pour parser une ligne PAC_DET et mettre à jour les caches ---
-def parse_et_maj_caches_specialises(pac_det_chaine, cache_actuel, hist_prof, hist_var, hist_trans):
-    pac_det_chaine = pac_det_chaine.strip()
-    maj_effectuee = False
+def convertir_entier(value):
+    decimal_value = convertir_decimal(value)
+
+    if decimal_value is None:
+        return None
 
     try:
-        if pac_det_chaine.startswith("~Re/!"):
-            partie_donnees = pac_det_chaine.split("!", 1)[1]
-            champs = partie_donnees.split('|')
+        return int(decimal_value)
 
-            mnemonique = _get_champ(champs, 0)
-            if not mnemonique:
-                # print(f"AVERT: Ligne d'instrument sans mnémonique: {pac_det_chaine}") # Optionnel
-                return False
-
-            # --- Parsing des champs (identique à avant) ---
-            code_isin = _get_champ(champs, 1)
-            groupe_marche = _get_champ(champs, 2)
-            cours_veille = _try_parse_float(_get_champ(champs, 3))
-            cours_min_jour = _try_parse_float(_get_champ(champs, 4))
-            cours_max_jour = _try_parse_float(_get_champ(champs, 5))
-            dernier_cours = _try_parse_float(_get_champ(champs, 6))
-            variation_pct_str = _get_champ(champs, 7)
-            variation_pct = _try_parse_float(variation_pct_str) if variation_pct_str != '-' else 0.0
-            quantite_echangee = _try_parse_int(_get_champ(champs, 8))
-            seuil_bas = _try_parse_float(_get_champ(champs, 9))
-            seuil_haut = _try_parse_float(_get_champ(champs, 10))
-            prix_theorique = _try_parse_float(_get_champ(champs, 11))
-            quantite_theorique = _try_parse_int(_get_champ(champs, 12))
-            variation_theorique_str = _get_champ(champs, 13)
-            cours_ouverture = _try_parse_float(_get_champ(champs, 14))
-
-            # Carnet d'ordres
-            nb_ordres_achat_1 = _try_parse_int(_get_champ(champs, 15))
-            qte_achat_1 = _try_parse_int(_get_champ(champs, 16))
-            cours_achat_1 = _parse_prix_achat_vente(_get_champ(champs, 17))
-            cours_vente_1 = _parse_prix_achat_vente(_get_champ(champs, 18))
-            qte_vente_1 = _try_parse_int(_get_champ(champs, 19))
-            nb_ordres_vente_1 = _try_parse_int(_get_champ(champs, 20))
-            # ... (Répéter pour les niveaux 2 à 5, ou créer une boucle)
-            carnet_ordres_complet = []
-            for i in range(5): # 5 niveaux
-                offset = i * 6 # 6 champs par niveau (NbA, QA, CA, CV, QV, NbV)
-                nb_a = _try_parse_int(_get_champ(champs, 15 + offset))
-                q_a = _try_parse_int(_get_champ(champs, 16 + offset))
-                c_a = _parse_prix_achat_vente(_get_champ(champs, 17 + offset))
-                c_v = _parse_prix_achat_vente(_get_champ(champs, 18 + offset))
-                q_v = _try_parse_int(_get_champ(champs, 19 + offset))
-                nb_v = _try_parse_int(_get_champ(champs, 20 + offset))
-                if any(v is not None for v in [nb_a, q_a, c_a, c_v, q_v, nb_v]): # Ajouter seulement si au moins une valeur existe
-                    carnet_ordres_complet.append({
-                        'nb_ordres_achat': nb_a, 'qte_achat': q_a, 'cours_achat': c_a,
-                        'cours_vente': c_v, 'qte_vente': q_v, 'nb_ordres_vente': nb_v
-                    })
+    except (
+        ValueError,
+        TypeError,
+        OverflowError,
+    ):
+        logger.warning(
+            "Valeur entière non convertible : %r",
+            value,
+        )
+        return None
 
 
-            valeur_echangee = _try_parse_float(_get_champ(champs, 45).replace(' ', ''))
-            valeur_cmp = _try_parse_float(_get_champ(champs, 46))
-            nom_instrument = _get_champ(champs, 47)
-            qte_dernier_echange = _try_parse_int(_get_champ(champs, 48)) # QtEE
-            info_dernier_echange = _get_champ(champs, 49) # Dern
-            statut_suspension = _get_champ(champs, 50).replace('\n', '').strip()
-            horodatage_derniere_exec_complet = _get_champ(champs, 51) # ex: "09/05/2025 14:30:25"
+def convertir_texte(
+    value,
+    max_length=None,
+):
+    if value is None:
+        return None
 
-            heure_derniere_exec = None
-            if horodatage_derniere_exec_complet and ' ' in horodatage_derniere_exec_complet:
-                 try: heure_derniere_exec = horodatage_derniere_exec_complet.split(' ')[1]
-                 except IndexError: heure_derniere_exec = horodatage_derniere_exec_complet
+    text = str(value).strip()
 
-            variation_montant = None
-            if dernier_cours is not None and cours_veille is not None and cours_veille != 0:
-                variation_montant = dernier_cours - cours_veille
+    if max_length is not None:
+        return text[:max_length]
 
-            # --- Mettre à jour le cache actuel ---
-            donnees_instrument_actuel = {
-                'mnemonique': mnemonique, 'code_isin': code_isin, 'groupe_marche': groupe_marche,
-                'nom': nom_instrument, 'cours_veille': cours_veille, 'cours_ouverture': cours_ouverture,
-                'cours_max_jour': cours_max_jour, 'cours_min_jour': cours_min_jour, 'dernier_cours': dernier_cours,
-                'variation_pourcentage': variation_pct, 'variation_montant': variation_montant,
-                'quantite_echangee': quantite_echangee, 'valeur_echangee': valeur_echangee,
-                'seuil_bas': seuil_bas, 'seuil_haut': seuil_haut,
-                'prix_theorique_ouverture': prix_theorique, 'quantite_theorique_ouverture': quantite_theorique,
-                'variation_theorique_ouverture': variation_theorique_str,
-                'carnet_ordres': carnet_ordres_complet, # Stocker le carnet complet
-                'valeur_cmp': valeur_cmp, 'quantite_dernier_echange': qte_dernier_echange,
-                'info_dernier_echange': info_dernier_echange, 'statut_suspension': statut_suspension,
-                'heure_derniere_execution': heure_derniere_exec,
-                'horodatage_derniere_execution': horodatage_derniere_exec_complet
-            }
-            cache_actuel[mnemonique] = donnees_instrument_actuel
-
-            # --- Clé pour l'historique : horodatage de l'exécution ou du message ---
-            cle_horodatage = horodatage_derniere_exec_complet
-            if not cle_horodatage: # Fallback si pas d'heure d'exécution spécifique
-                cle_horodatage = cache_actuel.get('_metadata_horodatage_message', datetime.now().isoformat(sep=' ', timespec='seconds'))
-
-            # --- 1. Historique Profondeur Marché ---
-            if mnemonique not in hist_prof:
-                hist_prof[mnemonique] = {}
-                # On ne stocke que le carnet d'ordres et le timestamp de la source
-                hist_prof[mnemonique][cle_horodatage] = {
-                    'carnet_ordres': carnet_ordres_complet,
-                    'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')
-                }
-            else :
-                hist_prof[mnemonique][cle_horodatage] = {
-                    'carnet_ordres': carnet_ordres_complet,
-                    'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')}
+    return text
 
 
-            # --- 2. Historique Variation Marché ---
-            if mnemonique not in hist_var:
-                hist_var[mnemonique] = {}
-                hist_var[mnemonique][cle_horodatage] = {
-                    'dernier_cours': dernier_cours,
-                    'variation_pourcentage': variation_pct,
-                    'variation_montant': variation_montant,
-                    'quantite_echangee_jour': quantite_echangee, # Volume total du jour
-                    'valeur_echangee_jour': valeur_echangee,   # Valeur totale du jour
-                    'cours_max_jour': cours_max_jour,
-                    'cours_min_jour': cours_min_jour,
-                    'cours_ouverture': cours_ouverture,
-                    'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')
-                }
-            else :
-                hist_var[mnemonique][cle_horodatage] = {
-                    'dernier_cours': dernier_cours,
-                    'variation_pourcentage': variation_pct,
-                    'variation_montant': variation_montant,
-                    'quantite_echangee_jour': quantite_echangee, # Volume total du jour
-                    'valeur_echangee_jour': valeur_echangee,   # Valeur totale du jour
-                    'cours_max_jour': cours_max_jour,
-                    'cours_min_jour': cours_min_jour,
-                    'cours_ouverture': cours_ouverture,
-                    'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')
-                }
+def convertir_json(value):
+    if value is None:
+        value = []
 
-            # --- 3. Historique Transactions (interprété comme la dernière transaction du snapshot) ---
-            if qte_dernier_echange is not None and dernier_cours is not None : # Si une transaction semble avoir eu lieu
-                if mnemonique not in hist_trans:
-                    hist_trans[mnemonique] = {}
-                    hist_trans[mnemonique][cle_horodatage] = {
-                        'cours_transaction': dernier_cours, # Le dernier cours est le cours de la "dernière transaction" dans ce snapshot
-                        'quantite_transaction': qte_dernier_echange, # QtEE
-                        'info_transaction': info_dernier_echange, # Dern
-                        'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')
-                    }
-                    maj_effectuee = True
-                else:
-                    hist_trans[mnemonique][cle_horodatage] = {
-                        'cours_transaction': dernier_cours, # Le dernier cours est le cours de la "dernière transaction" dans ce snapshot
-                        'quantite_transaction': qte_dernier_echange, # QtEE
-                        'info_transaction': info_dernier_echange, # Dern
-                        'horodatage_source_message': cache_actuel.get('_metadata_horodatage_message')
-                    }
-                    maj_effectuee = True
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        default=str,
+    )
 
 
-        # --- Gestion des métadonnées (pour le cache actuel) ---
-        elif pac_det_chaine.startswith("~finresm/"):
-            valeur = pac_det_chaine.split('/', 1)[1]
-            cache_actuel['_metadata_finresm'] = _try_parse_float(valeur)
-            maj_effectuee = True
-        elif pac_det_chaine.startswith("~CT/"):
-            valeur = pac_det_chaine.split('/', 1)[1]
-            cache_actuel['_metadata_horodatage_message'] = valeur
-            maj_effectuee = True
-        elif pac_det_chaine.startswith("~VA/"):
-            valeur = pac_det_chaine.split('/', 1)[1]
-            cache_actuel['_metadata_valeur_agregee_va'] = _try_parse_int(valeur)
-            maj_effectuee = True
-        else:
-             pass
-    except Exception as e:
-        print(f"ERREUR: Erreur de parsing sur la ligne: '{pac_det_chaine}' - {type(e).__name__}: {e}")
-        # import traceback; traceback.print_exc() # Pour un débogage plus poussé
-        return False
-    return maj_effectuee
+# ============================================================
+# 10. CLIENT AIVEN
+# ============================================================
 
-# --- Fonction pour traiter un bloc XML complet ---
-def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
-    try:
-        if isinstance(chaine_xml, str): chaine_xml_bytes = chaine_xml.encode('utf-8')
-        else: chaine_xml_bytes = chaine_xml
-        racine = ET.fromstring(chaine_xml_bytes)
-        type_msg_elem = racine.find('TYPE')
-        if racine.tag != 'REP' or type_msg_elem is None or type_msg_elem.text != 'MKT':
-            print(f"AVERT: Format XML racine ou TYPE inattendu.")
-            return False
-        pacq = racine.find('PACQ')
-        if pacq is None:
-            print("AVERT: Balise PACQ non trouvée.")
-            return False
-        maj_effectuees = 0
-        for pac_det in pacq.findall('PAC_DET'):
-            if pac_det.text:
-                if parse_et_maj_caches_specialises(pac_det.text, cache_actuel, hist_prof, hist_var, hist_trans):
-                    maj_effectuees += 1
-        # print(f"--- Bloc XML traité. {maj_effectuees} mises à jour détectées. Horodatage global: {cache_actuel.get('_metadata_horodatage_message', 'N/A')} ---")
+class AivenMySQLClient:
+
+    def __init__(self):
+        self.connection = None
+        self.last_storage_check = 0.0
+        self.last_storage_size_mb = 0.0
+
+    def _ssl_configuration(self):
+        ca_path = Path(
+            AIVEN_CA_CERT
+        ).expanduser()
+
+        if not ca_path.is_absolute():
+            ca_path = BASE_DIR / ca_path
+
+        return {
+            "ca": str(ca_path),
+            "check_hostname": True,
+        }
+
+    def connect(self):
+        self.close()
+
+        logger.info(
+            "Connexion Aiven MySQL | host=%s | port=%s | "
+            "database=%s | user=%s",
+            AIVEN_MYSQL_HOST,
+            AIVEN_MYSQL_PORT,
+            AIVEN_MYSQL_DATABASE,
+            AIVEN_MYSQL_USER,
+        )
+
+        self.connection = pymysql.connect(
+            host=AIVEN_MYSQL_HOST,
+            port=int(AIVEN_MYSQL_PORT),
+            user=AIVEN_MYSQL_USER,
+            password=AIVEN_MYSQL_PASSWORD,
+            database=AIVEN_MYSQL_DATABASE,
+            charset="utf8mb4",
+            autocommit=False,
+            connect_timeout=DB_CONNECT_TIMEOUT,
+            read_timeout=DB_READ_TIMEOUT,
+            write_timeout=DB_WRITE_TIMEOUT,
+            cursorclass=pymysql.cursors.DictCursor,
+            ssl=self._ssl_configuration(),
+        )
+
+        logger.info(
+            "Connexion Aiven for MySQL établie."
+        )
+
+        return self.connection
+
+    def ensure_connection(self):
+        if self.connection is None:
+            return self.connect()
+
+        try:
+            self.connection.ping(
+                reconnect=True
+            )
+
+        except Exception:
+            logger.exception(
+                "Connexion Aiven perdue. Reconnexion."
+            )
+
+            return self.connect()
+
+        return self.connection
+
+    def test_connection(self):
+        connection = self.ensure_connection()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    VERSION() AS mysql_version,
+                    DATABASE() AS database_name,
+                    CURRENT_USER() AS connected_user
+                """
+            )
+
+            result = cursor.fetchone()
+
+        logger.info(
+            "Test Aiven réussi | MySQL=%s | Base=%s | User=%s",
+            result.get("mysql_version"),
+            result.get("database_name"),
+            result.get("connected_user"),
+        )
+
+        if (
+            result.get("database_name")
+            != AIVEN_MYSQL_DATABASE
+        ):
+            raise RuntimeError(
+                f"La base active n'est pas {AIVEN_MYSQL_DATABASE!r}."
+            )
+
+        return result
+
+    def ensure_table(self):
+        connection = self.ensure_connection()
+
+        sql = f"""
+        CREATE TABLE IF NOT EXISTS `{AIVEN_MYSQL_TABLE}` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+
+            `nom` VARCHAR(255) NULL,
+            `code_isin` VARCHAR(64) NULL,
+            `seuil_bas` DECIMAL(30,10) NULL,
+            `mnemonique` VARCHAR(64) NOT NULL,
+            `seuil_haut` DECIMAL(30,10) NULL,
+            `valeur_cmp` DECIMAL(30,10) NULL,
+
+            `cours_veille` DECIMAL(30,10) NULL,
+            `carnet_ordres` JSON NULL,
+            `dernier_cours` DECIMAL(30,10) NULL,
+            `groupe_marche` VARCHAR(64) NULL,
+
+            `cours_max_jour` DECIMAL(30,10) NULL,
+            `cours_min_jour` DECIMAL(30,10) NULL,
+            `cours_ouverture` DECIMAL(30,10) NULL,
+
+            `valeur_echangee` DECIMAL(36,10) NULL,
+            `quantite_echangee` BIGINT NULL,
+
+            `statut_suspension` VARCHAR(255) NULL,
+
+            `variation_montant` DECIMAL(30,10) NULL,
+            `info_dernier_echange` VARCHAR(255) NULL,
+            `variation_pourcentage` DECIMAL(30,10) NULL,
+
+            `heure_derniere_execution` VARCHAR(64) NULL,
+
+            `prix_theorique_ouverture` DECIMAL(30,10) NULL,
+            `quantite_dernier_echange` BIGINT NULL,
+            `quantite_theorique_ouverture` BIGINT NULL,
+
+            `horodatage_derniere_execution` VARCHAR(128) NULL,
+            `variation_theorique_ouverture` DECIMAL(30,10) NULL,
+
+            `collected_at` DATETIME(6) NOT NULL,
+
+            PRIMARY KEY (`id`),
+
+            INDEX `idx_brvm_mnemonique`
+                (`mnemonique`),
+
+            INDEX `idx_brvm_code_isin`
+                (`code_isin`),
+
+            INDEX `idx_brvm_collected_at`
+                (`collected_at`),
+
+            INDEX `idx_brvm_mnemonique_date`
+                (`mnemonique`, `collected_at`)
+        )
+        ENGINE=InnoDB
+        DEFAULT CHARSET=utf8mb4
+        COLLATE=utf8mb4_unicode_ci
+        """
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql)
+
+                cursor.execute(
+                    f"""
+                    ALTER TABLE `{AIVEN_MYSQL_TABLE}`
+                    AUTO_INCREMENT = {AIVEN_FIRST_ID}
+                    """
+                )
+
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        self._verifier_schema()
+
+        logger.info(
+            "Table prête : %s.%s | AUTO_INCREMENT >= %s",
+            AIVEN_MYSQL_DATABASE,
+            AIVEN_MYSQL_TABLE,
+            AIVEN_FIRST_ID,
+        )
+
+    def _verifier_schema(self):
+        colonnes_attendues = {
+            "id",
+            "nom",
+            "code_isin",
+            "seuil_bas",
+            "mnemonique",
+            "seuil_haut",
+            "valeur_cmp",
+            "cours_veille",
+            "carnet_ordres",
+            "dernier_cours",
+            "groupe_marche",
+            "cours_max_jour",
+            "cours_min_jour",
+            "cours_ouverture",
+            "valeur_echangee",
+            "quantite_echangee",
+            "statut_suspension",
+            "variation_montant",
+            "info_dernier_echange",
+            "variation_pourcentage",
+            "heure_derniere_execution",
+            "prix_theorique_ouverture",
+            "quantite_dernier_echange",
+            "quantite_theorique_ouverture",
+            "horodatage_derniere_execution",
+            "variation_theorique_ouverture",
+            "collected_at",
+        }
+
+        connection = self.ensure_connection()
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SHOW COLUMNS
+                FROM `{AIVEN_MYSQL_TABLE}`
+                """
+            )
+
+            result = cursor.fetchall()
+
+        colonnes_actuelles = {
+            row["Field"]
+            for row in result
+        }
+
+        manquantes = (
+            colonnes_attendues
+            - colonnes_actuelles
+        )
+
+        if manquantes:
+            raise RuntimeError(
+                "Schéma de table incompatible. "
+                "Colonnes manquantes : "
+                + ", ".join(
+                    sorted(manquantes)
+                )
+            )
+
+    def get_database_size_mb(self):
+        connection = self.ensure_connection()
+
+        sql = """
+        SELECT
+            COALESCE(
+                SUM(data_length + index_length),
+                0
+            ) / 1024 / 1024 AS size_mb
+        FROM information_schema.tables
+        WHERE table_schema = %s
+        """
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql,
+                (AIVEN_MYSQL_DATABASE,),
+            )
+
+            result = cursor.fetchone()
+
+        return float(
+            result.get("size_mb") or 0.0
+        )
+
+    def check_storage_limit(
+        self,
+        force=False,
+    ):
+        now = time_module.time()
+
+        if (
+            not force
+            and (
+                now
+                - self.last_storage_check
+                < STORAGE_CHECK_INTERVAL_SECONDS
+            )
+        ):
+            return True
+
+        size_mb = self.get_database_size_mb()
+
+        self.last_storage_check = now
+        self.last_storage_size_mb = size_mb
+
+        percentage = (
+            size_mb
+            / AIVEN_MAX_STORAGE_MB
+            * 100
+        )
+
+        logger.info(
+            "Stockage logique defaultdb : %.2f Mo / %.2f Mo "
+            "(%.1f%% du seuil configuré)",
+            size_mb,
+            AIVEN_MAX_STORAGE_MB,
+            percentage,
+        )
+
+        if (
+            size_mb
+            >= AIVEN_MAX_STORAGE_MB
+        ):
+            raise StorageLimitReached(
+                "Seuil de stockage Aiven atteint : "
+                f"{size_mb:.2f} Mo / "
+                f"{AIVEN_MAX_STORAGE_MB:.2f} Mo"
+            )
+
         return True
-    except ET.ParseError as e: print(f"ERREUR: Erreur de parsing XML: {e}"); return False
-    except Exception as e: print(f"ERREUR: Erreur inattendue: {e}"); return False
 
+    def insert_market_snapshot(
+        self,
+        donnees_marche,
+    ):
+        if not donnees_marche:
+            return 0
 
-#............................ Fonctions pour exporter les données ...............................
+        self.check_storage_limit()
 
-# --- Fonctions d'exportation ---
+        connection = self.ensure_connection()
 
-def exporter_donnees_actuelles_csv(donnees_cache, nom_fichier="donnees_actuelles.csv"):
-    """Exporte le cache actuel des données de marché en CSV."""
-    if not donnees_cache:
-        print("Cache des données actuelles vide, rien à exporter en CSV.")
-        return
+        collected_at = datetime.now()
 
-    # Déterminer les en-têtes
-    # On prend les clés du premier instrument comme base, en espérant qu'ils soient cohérents
-    # Exclure les métadonnées commençant par '_'
-    cles_instruments = [k for k in donnees_cache.keys() if not k.startswith('_')]
-    if not cles_instruments:
-        print("Cache des données actuelles ne contient que des métadonnées, rien à exporter en CSV.")
-        return
+        sql = f"""
+        INSERT INTO `{AIVEN_MYSQL_TABLE}`
+        (
+            `nom`,
+            `code_isin`,
+            `seuil_bas`,
+            `mnemonique`,
+            `seuil_haut`,
+            `valeur_cmp`,
+            `cours_veille`,
+            `carnet_ordres`,
+            `dernier_cours`,
+            `groupe_marche`,
+            `cours_max_jour`,
+            `cours_min_jour`,
+            `cours_ouverture`,
+            `valeur_echangee`,
+            `quantite_echangee`,
+            `statut_suspension`,
+            `variation_montant`,
+            `info_dernier_echange`,
+            `variation_pourcentage`,
+            `heure_derniere_execution`,
+            `prix_theorique_ouverture`,
+            `quantite_dernier_echange`,
+            `quantite_theorique_ouverture`,
+            `horodatage_derniere_execution`,
+            `variation_theorique_ouverture`,
+            `collected_at`
+        )
+        VALUES
+        (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s
+        )
+        """
 
-    premier_instrument = donnees_cache[cles_instruments[0]]
-    entetes_base = list(premier_instrument.keys())
+        lignes = []
 
-    # Gérer l'aplatissement du carnet d'ordres pour CSV
-    entetes_carnet = []
-    max_niveaux_carnet = 0
-    if 'carnet_ordres' in premier_instrument and premier_instrument['carnet_ordres']:
-        max_niveaux_carnet = len(premier_instrument['carnet_ordres']) # Supposons 5
-        for i in range(1, max_niveaux_carnet + 1):
-            entetes_carnet.extend([
-                f'carnet_nb_ordres_achat_{i}', f'carnet_qte_achat_{i}', f'carnet_cours_achat_{i}',
-                f'carnet_cours_vente_{i}', f'carnet_qte_vente_{i}', f'carnet_nb_ordres_vente_{i}'
-            ])
-    entetes_finales = [e for e in entetes_base if e != 'carnet_ordres'] + entetes_carnet
+        for (
+            cle_instrument,
+            data,
+        ) in donnees_marche.items():
 
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes_finales, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_instrument in donnees_cache.items():
-            if mnemonique.startswith('_'): # Ignorer les métadonnées
+            if not isinstance(
+                data,
+                dict,
+            ):
                 continue
-            
-            ligne_aplanie = data_instrument.copy()
-            if 'carnet_ordres' in ligne_aplanie:
-                carnet = ligne_aplanie.pop('carnet_ordres') # Enlever la liste
-                for i, niveau in enumerate(carnet):
-                    if i < max_niveaux_carnet : # S'assurer de ne pas dépasser
-                        ligne_aplanie[f'carnet_nb_ordres_achat_{i+1}'] = niveau.get('nb_ordres_achat')
-                        ligne_aplanie[f'carnet_qte_achat_{i+1}'] = niveau.get('qte_achat')
-                        ligne_aplanie[f'carnet_cours_achat_{i+1}'] = niveau.get('cours_achat')
-                        ligne_aplanie[f'carnet_cours_vente_{i+1}'] = niveau.get('cours_vente')
-                        ligne_aplanie[f'carnet_qte_vente_{i+1}'] = niveau.get('qte_vente')
-                        ligne_aplanie[f'carnet_nb_ordres_vente_{i+1}'] = niveau.get('nb_ordres_vente')
-            writer.writerow(ligne_aplanie)
-    print(f"Données actuelles exportées vers {nom_fichier}")
+
+            mnemonique = convertir_texte(
+                data.get(
+                    "mnemonique",
+                    cle_instrument,
+                ),
+                64,
+            )
+
+            if not mnemonique:
+                continue
+
+            lignes.append(
+                (
+                    convertir_texte(
+                        data.get("nom"),
+                        255,
+                    ),
+                    convertir_texte(
+                        data.get("code_isin"),
+                        64,
+                    ),
+                    convertir_decimal(
+                        data.get("seuil_bas")
+                    ),
+                    mnemonique,
+                    convertir_decimal(
+                        data.get("seuil_haut")
+                    ),
+                    convertir_decimal(
+                        data.get("valeur_cmp")
+                    ),
+                    convertir_decimal(
+                        data.get("cours_veille")
+                    ),
+                    convertir_json(
+                        data.get(
+                            "carnet_ordres",
+                            [],
+                        )
+                    ),
+                    convertir_decimal(
+                        data.get("dernier_cours")
+                    ),
+                    convertir_texte(
+                        data.get("groupe_marche"),
+                        64,
+                    ),
+                    convertir_decimal(
+                        data.get("cours_max_jour")
+                    ),
+                    convertir_decimal(
+                        data.get("cours_min_jour")
+                    ),
+                    convertir_decimal(
+                        data.get("cours_ouverture")
+                    ),
+                    convertir_decimal(
+                        data.get("valeur_echangee")
+                    ),
+                    convertir_entier(
+                        data.get("quantite_echangee")
+                    ),
+                    convertir_texte(
+                        data.get(
+                            "statut_suspension"
+                        ),
+                        255,
+                    ),
+                    convertir_decimal(
+                        data.get("variation_montant")
+                    ),
+                    convertir_texte(
+                        data.get(
+                            "info_dernier_echange"
+                        ),
+                        255,
+                    ),
+                    convertir_decimal(
+                        data.get(
+                            "variation_pourcentage"
+                        )
+                    ),
+                    convertir_texte(
+                        data.get(
+                            "heure_derniere_execution"
+                        ),
+                        64,
+                    ),
+                    convertir_decimal(
+                        data.get(
+                            "prix_theorique_ouverture"
+                        )
+                    ),
+                    convertir_entier(
+                        data.get(
+                            "quantite_dernier_echange"
+                        )
+                    ),
+                    convertir_entier(
+                        data.get(
+                            "quantite_theorique_ouverture"
+                        )
+                    ),
+                    convertir_texte(
+                        data.get(
+                            "horodatage_derniere_execution"
+                        ),
+                        128,
+                    ),
+                    convertir_decimal(
+                        data.get(
+                            "variation_theorique_ouverture"
+                        )
+                    ),
+                    collected_at,
+                )
+            )
+
+        if not lignes:
+            return 0
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    sql,
+                    lignes,
+                )
+
+            connection.commit()
+
+            logger.info(
+                "%s ligne(s) enregistrée(s) dans %s.%s.",
+                len(lignes),
+                AIVEN_MYSQL_DATABASE,
+                AIVEN_MYSQL_TABLE,
+            )
+
+            return len(lignes)
+
+        except pymysql.MySQLError as exc:
+            connection.rollback()
+
+            message = str(exc).lower()
+
+            if any(
+                mot in message
+                for mot in (
+                    "disk full",
+                    "no space",
+                    "out of space",
+                    "quota",
+                    "table is full",
+                )
+            ):
+                raise StorageLimitReached(
+                    f"Aiven/MySQL signale un stockage plein : {exc}"
+                ) from exc
+
+            raise
+
+    def close(self):
+        if (
+            self.connection is not None
+        ):
+            try:
+                self.connection.close()
+
+            except Exception:
+                pass
+
+            finally:
+                self.connection = None
 
 
-def exporter_historique_profondeur_csv(historique, nom_fichier="hist_profondeur.csv"):
-    """Exporte l'historique de la profondeur du marché en CSV."""
-    if not historique:
-        print("Historique de profondeur vide, rien à exporter en CSV.")
+db = AivenMySQLClient()
+
+
+# ============================================================
+# 11. DONNÉES EN MÉMOIRE
+# ============================================================
+
+donnees_marche_cache_actuel = {}
+
+historique_profondeur_marche = {}
+historique_variation_marche = {}
+historique_transactions = {}
+
+historical_data = deque(maxlen=MAX_RAW_RESPONSES_IN_MEMORY)
+
+
+# ============================================================
+# 12. CALENDRIER DE COLLECTE + SERVEUR HTTP RENDER
+# ============================================================
+
+def maintenant_marche():
+    """
+    Heure courante dans le fuseau choisi pour la collecte.
+    """
+    return datetime.now(
+        COLLECT_TIMEZONE
+    )
+
+
+def est_jour_ouvre(moment=None):
+    """
+    Lundi=0 ... vendredi=4.
+    Samedi et dimanche sont toujours exclus.
+    """
+    if moment is None:
+        moment = maintenant_marche()
+
+    return moment.weekday() < 5
+
+
+def est_dans_fenetre_collecte(moment=None):
+    """
+    True uniquement :
+      - du lundi au vendredi ;
+      - entre 10h00 et 16h30 incluses
+        (ou les valeurs définies dans .env).
+    """
+    if moment is None:
+        moment = maintenant_marche()
+
+    if not est_jour_ouvre(moment):
+        return False
+
+    heure = moment.time().replace(
+        tzinfo=None
+    )
+
+    return (
+        COLLECT_START_TIME
+        <= heure
+        <= COLLECT_END_TIME
+    )
+
+
+def prochaine_ouverture(moment=None):
+    """
+    Calcule la prochaine ouverture du créneau de collecte.
+    """
+    if moment is None:
+        moment = maintenant_marche()
+
+    # Si nous sommes avant l'ouverture d'un jour ouvré,
+    # l'ouverture est aujourd'hui.
+    if (
+        est_jour_ouvre(moment)
+        and moment.time().replace(tzinfo=None)
+        < COLLECT_START_TIME
+    ):
+        return datetime.combine(
+            moment.date(),
+            COLLECT_START_TIME,
+            tzinfo=COLLECT_TIMEZONE,
+        )
+
+    # Sinon, recherche le prochain jour ouvré.
+    for decalage in range(1, 8):
+        prochaine_date = (
+            moment.date()
+            + timedelta(days=decalage)
+        )
+
+        if prochaine_date.weekday() < 5:
+            return datetime.combine(
+                prochaine_date,
+                COLLECT_START_TIME,
+                tzinfo=COLLECT_TIMEZONE,
+            )
+
+    raise RuntimeError(
+        "Impossible de calculer la prochaine ouverture."
+    )
+
+
+def attendre_fenetre_collecte():
+    """
+    Hors marché, ne lance pas Selenium.
+    Le processus reste disponible pour le serveur HTTP Render.
+    """
+    while True:
+        moment = maintenant_marche()
+
+        if est_dans_fenetre_collecte(
+            moment
+        ):
+            logger.info(
+                "Fenêtre de collecte ouverte | %s",
+                moment.isoformat(),
+            )
+            return
+
+        prochaine = prochaine_ouverture(
+            moment
+        )
+
+        secondes = max(
+            1,
+            int(
+                (
+                    prochaine
+                    - moment
+                ).total_seconds()
+            ),
+        )
+
+        logger.info(
+            "Collecte inactive | maintenant=%s | "
+            "prochaine ouverture=%s",
+            moment.strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            ),
+            prochaine.strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            ),
+        )
+
+        time_module.sleep(
+            min(
+                OUTSIDE_WINDOW_CHECK_SECONDS,
+                secondes,
+            )
+        )
+
+
+class RenderHealthHandler(
+    BaseHTTPRequestHandler
+):
+    """
+    Petit endpoint HTTP pour Render :
+      GET /
+      GET /health
+    """
+
+    def do_GET(self):
+        moment = maintenant_marche()
+
+        payload = {
+            "status": "ok",
+            "service": "brvm-collector",
+            "timezone": COLLECT_TIMEZONE_NAME,
+            "local_time": moment.isoformat(),
+            "weekday": moment.strftime("%A"),
+            "collection_window_open": (
+                est_dans_fenetre_collecte(
+                    moment
+                )
+            ),
+            "collection_schedule": (
+                f"Monday-Friday "
+                f"{COLLECT_START_TIME.strftime('%H:%M')}"
+                f"-{COLLECT_END_TIME.strftime('%H:%M')}"
+            ),
+            "database": AIVEN_MYSQL_DATABASE,
+            "table": AIVEN_MYSQL_TABLE,
+        }
+
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
+        # Évite de polluer collecte_brvm.log à chaque health check.
         return
 
-    entetes = ['mnemonique', 'horodatage_execution', 'horodatage_source_message',
-               'niveau_carnet', 'nb_ordres_achat', 'qte_achat', 'cours_achat',
-               'cours_vente', 'qte_vente', 'nb_ordres_vente']
 
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.writer(fichier_csv)
-        writer.writerow(entetes)
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                horodatage_source = data_exec.get('horodatage_source_message', '')
-                for i, niveau in enumerate(data_exec.get('carnet_ordres', [])):
-                    writer.writerow([
-                        mnemonique, horodatage_exec, horodatage_source, i + 1,
-                        niveau.get('nb_ordres_achat'), niveau.get('qte_achat'), niveau.get('cours_achat'),
-                        niveau.get('cours_vente'), niveau.get('qte_vente'), niveau.get('nb_ordres_vente')
-                    ])
-    print(f"Historique de profondeur exporté vers {nom_fichier}")
+def demarrer_serveur_render():
+    """
+    Un Web Service Render doit écouter le port fourni par $PORT.
+    """
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", port),
+        RenderHealthHandler,
+    )
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health-server",
+        daemon=True,
+    )
+
+    thread.start()
+
+    logger.info(
+        "Serveur HTTP Render actif sur 0.0.0.0:%s "
+        "(/ et /health)",
+        port,
+    )
+
+    return server
 
 
-def exporter_historique_variation_csv(historique, nom_fichier="hist_variation.csv"):
-    """Exporte l'historique des variations de marché en CSV."""
-    if not historique:
-        print("Historique de variation vide, rien à exporter en CSV.")
+# ============================================================
+# 13. SELENIUM
+# ============================================================
+
+def creer_driver():
+    options = Options()
+
+    if CHROME_HEADLESS:
+        options.add_argument(
+            "--headless=new"
+        )
+
+    options.add_argument(
+        "--disable-blink-features=AutomationControlled"
+    )
+
+    options.add_argument(
+        "--disable-dev-shm-usage"
+    )
+
+    options.add_argument(
+        "--no-sandbox"
+    )
+
+    options.add_argument(
+        "--window-size=1920,1080"
+    )
+
+    options.add_experimental_option(
+        "excludeSwitches",
+        ["enable-automation"],
+    )
+
+    options.add_experimental_option(
+        "useAutomationExtension",
+        False,
+    )
+
+    options.set_capability(
+        "goog:loggingPrefs",
+        {
+            "performance": "ALL",
+        },
+    )
+
+    driver_instance = webdriver.Chrome(
+        options=options
+    )
+
+    # Active explicitement le domaine Network CDP.
+    driver_instance.execute_cdp_cmd(
+        "Network.enable",
+        {}
+    )
+
+    driver_instance.set_page_load_timeout(
+        25
+    )
+
+    driver_instance.implicitly_wait(
+        2
+    )
+
+    return driver_instance
+
+
+def start(
+    driver_instance,
+):
+    logger.info(
+        "Ouverture SGI : %s",
+        SGI_BASE_URL,
+    )
+
+    driver_instance.get(
+        SGI_BASE_URL
+    )
+
+def est_connecte(
+    driver_instance,
+    timeout=5,
+):
+    try:
+        WebDriverWait(
+            driver_instance,
+            timeout,
+        ).until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    (
+                        "/html/body/div[1]/div/div[3]"
+                        "/table/tbody/tr/td[2]/div"
+                    ),
+                )
+            )
+        )
+
+        return True
+
+    except TimeoutException:
+        return False
+
+def signin(
+    driver_instance,
+):
+    logger.info(
+        "Tentative de connexion au compte SGI."
+    )
+
+    wait = WebDriverWait(
+        driver_instance,
+        30,
+    )
+
+    login_input = wait.until(
+        EC.visibility_of_element_located(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[1]"
+                ),
+            )
+        )
+    )
+
+    password_input = wait.until(
+        EC.visibility_of_element_located(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[2]"
+                ),
+            )
+        )
+    )
+
+    connect_button = wait.until(
+        EC.element_to_be_clickable(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[3]"
+                ),
+            )
+        )
+    )
+
+    login_input.clear()
+    login_input.send_keys(
+        SGI_LOGIN
+    )
+
+    password_input.clear()
+    password_input.send_keys(
+        SGI_PASSWORD
+    )
+
+    logger.info(
+        "Formulaire SGI rempli."
+    )
+
+    connect_button.click()
+
+    logger.info(
+        "Bouton de connexion SGI cliqué."
+    )
+
+def assurer_connexion_sgi(
+    driver_instance,
+):
+    # La session est peut-être déjà ouverte.
+    if est_connecte(
+        driver_instance,
+        timeout=5,
+    ):
+        logger.info(
+            "Session SGI déjà connectée."
+        )
+        return True
+
+    logger.info(
+        "Session SGI non connectée. "
+        "Tentative d'authentification."
+    )
+
+    signin(
+        driver_instance
+    )
+
+    # On laisse maintenant jusqu'à 30 secondes au site
+    # pour terminer l'authentification.
+    if est_connecte(
+        driver_instance,
+        timeout=30,
+    ):
+        logger.info(
+            "Connexion SGI confirmée."
+        )
+        return True
+
+    # ========================================================
+    # DIAGNOSTIC
+    # ========================================================
+
+    try:
+        logger.error(
+            "Échec connexion SGI | URL actuelle : %s",
+            driver_instance.current_url,
+        )
+
+        logger.error(
+            "Échec connexion SGI | Titre page : %s",
+            driver_instance.title,
+        )
+
+        body_text = driver_instance.find_element(
+            By.TAG_NAME,
+            "body",
+        ).text
+
+        # Seulement les 2000 premiers caractères.
+        # On évite de remplir les logs Render.
+        logger.error(
+            "Contenu visible de la page SGI : %s",
+            body_text[:2000],
+        )
+
+    except Exception as diagnostic_error:
+        logger.warning(
+            "Impossible de récupérer le diagnostic SGI : %s",
+            diagnostic_error,
+        )
+
+    raise RuntimeError(
+        "Impossible de confirmer la connexion SGI "
+        "après 30 secondes."
+    )
+
+
+def get_response_body(
+    driver_instance,
+    request_id,
+):
+    """
+    Récupère le body d'une réponse réseau APRÈS Network.loadingFinished.
+
+    Chrome peut parfois renvoyer le body encodé en base64.
+    """
+    try:
+        response = (
+            driver_instance
+            .execute_cdp_cmd(
+                "Network.getResponseBody",
+                {
+                    "requestId": request_id,
+                },
+            )
+        )
+
+        body = response.get(
+            "body"
+        )
+
+        if not body:
+            return None
+
+        if response.get(
+            "base64Encoded"
+        ):
+            try:
+                body = base64.b64decode(
+                    body
+                ).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "Impossible de décoder le body base64 "
+                    "requestId=%s : %s",
+                    request_id,
+                    exc,
+                )
+
+        return body
+
+    except Exception as exc:
+        logger.warning(
+            "Body indisponible après loadingFinished "
+            "requestId=%s : %s",
+            request_id,
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
+# 14. ALERTES PORTEFEUILLE
+# ============================================================
+
+def _normaliser_float(value):
+    result = convertir_decimal(
+        value
+    )
+
+    if result is None:
+        return None
+
+    return float(result)
+
+
+def _normaliser_entier(value):
+    result = convertir_entier(
+        value
+    )
+
+    if result is None:
+        return 0
+
+    return result
+
+
+def signale(
+    driver_instance,
+):
+    """
+    Contrôle du portefeuille.
+    En mode 24h/headless, on écrit les alertes dans les logs.
+    Aucun popup Tkinter n'est utilisé.
+    """
+
+    logger.info(
+        "Contrôle du portefeuille SGI."
+    )
+
+    link_portefeuille = (
+        driver_instance.find_element(
+            By.XPATH,
+            (
+                "/html/body/div[1]/div/div[3]"
+                "/table/tbody/tr/td[2]/div/button"
+            ),
+        )
+    )
+
+    link_portefeuille.click()
+
+    time_module.sleep(
+        1
+    )
+
+    n = 18
+
+    actifs_rendements = []
+    actifs_nbr = []
+    actifs_name = []
+
+    for m in range(2, n):
+        xpath = (
+            "/html/body/div[7]/div[2]/div/div[2]"
+            "/div[2]/div[2]/div/div/table/tbody"
+            f"/tr[{m}]/td[11]"
+        )
+
+        actifs_rendements.append(
+            driver_instance.find_element(
+                By.XPATH,
+                xpath,
+            ).text
+        )
+
+    for m in range(2, n):
+        xpath = (
+            "/html/body/div[7]/div[2]/div/div[2]"
+            "/div[2]/div[2]/div/div/table/tbody"
+            f"/tr[{m}]/td[7]"
+        )
+
+        actifs_nbr.append(
+            driver_instance.find_element(
+                By.XPATH,
+                xpath,
+            ).text
+        )
+
+    for m in range(2, n):
+        xpath = (
+            "/html/body/div[7]/div[2]/div/div[2]"
+            "/div[2]/div[2]/div/div/table/tbody"
+            f"/tr[{m}]/td[2]"
+        )
+
+        actifs_name.append(
+            driver_instance.find_element(
+                By.XPATH,
+                xpath,
+            ).text
+        )
+
+    limite_rouge = -10
+    limite_orange = -7
+    limite_jaune = 10
+    limite_verte = 13
+
+    for (
+        index,
+        rendement_brut,
+    ) in enumerate(
+        actifs_rendements
+    ):
+        rendement = _normaliser_float(
+            rendement_brut
+        )
+
+        quantite = _normaliser_entier(
+            actifs_nbr[index]
+        )
+
+        if rendement is None:
+            continue
+
+        if (
+            rendement <= limite_rouge
+            and quantite > 1
+        ):
+            logger.warning(
+                "ZONE ROUGE | %s | rendement=%s",
+                actifs_name[index],
+                rendement,
+            )
+
+        elif (
+            rendement <= limite_orange
+            and quantite > 2
+        ):
+            logger.warning(
+                "ZONE ORANGE | %s | rendement=%s",
+                actifs_name[index],
+                rendement,
+            )
+
+        elif (
+            rendement >= limite_verte
+            and quantite > 3
+        ):
+            logger.info(
+                "ZONE VERTE | %s | rendement=%s",
+                actifs_name[index],
+                rendement,
+            )
+
+        elif (
+            rendement >= limite_jaune
+            and quantite > 2
+        ):
+            logger.info(
+                "ZONE JAUNE | %s | rendement=%s",
+                actifs_name[index],
+                rendement,
+            )
+
+
+# ============================================================
+# 15. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
+# ============================================================
+
+def limiter_historique_par_instrument(historique):
+    """
+    Les fonctions de parsing peuvent accumuler des horodatages sans limite.
+    On conserve seulement les N entrées les plus récentes par instrument.
+    """
+
+    for mnemonique, sous_historique in list(historique.items()):
+        if not isinstance(sous_historique, dict):
+            continue
+
+        depassement = (
+            len(sous_historique)
+            - MAX_HISTORY_PER_INSTRUMENT
+        )
+
+        if depassement <= 0:
+            continue
+
+        # Les dictionnaires Python conservent l'ordre d'insertion.
+        anciennes_cles = list(
+            sous_historique.keys()
+        )[:depassement]
+
+        for cle in anciennes_cles:
+            sous_historique.pop(
+                cle,
+                None,
+            )
+
+
+def nettoyer_historiques_memoire():
+    limiter_historique_par_instrument(
+        historique_profondeur_marche
+    )
+
+    limiter_historique_par_instrument(
+        historique_variation_marche
+    )
+
+    limiter_historique_par_instrument(
+        historique_transactions
+    )
+
+
+# ============================================================
+# 16. TRAITEMENT DES RÉPONSES MARCHÉ
+# ============================================================
+
+def traiter_reponse_marche(
+    response_body,
+    dernier_snapshot,
+):
+    global historical_data
+
+    historical_data.append(
+        [
+            time_module.strftime(
+                "%H:%M:%S"
+            ),
+            response_body,
+        ]
+    )
+
+    traiter_bloc_xml(
+        response_body,
+        donnees_marche_cache_actuel,
+        historique_profondeur_marche,
+        historique_variation_marche,
+        historique_transactions,
+    )
+
+    nettoyer_historiques_memoire()
+
+    snapshot_actuel = copy.deepcopy(
+        donnees_marche_cache_actuel
+    )
+
+    if not snapshot_actuel:
+        return dernier_snapshot
+
+    if (
+        dernier_snapshot is not None
+        and snapshot_actuel == dernier_snapshot
+    ):
+        return dernier_snapshot
+
+    db.insert_market_snapshot(
+        snapshot_actuel
+    )
+
+    return snapshot_actuel
+
+
+# ============================================================
+# 17. BOUCLE DE COLLECTE
+# ============================================================
+
+def collecte(
+    driver_instance,
+):
+    """
+    Collecte événementielle native du site SGI.
+
+    À chaque modification de marché, le site envoie lui-même
+    un nouveau POST MarketDetails.aspx.
+
+    Cycle suivi :
+        Network.requestWillBeSent
+            -> mémoriser requestId
+        Network.responseReceived
+            -> mémoriser le statut HTTP
+        Network.loadingFinished
+            -> Network.getResponseBody(requestId)
+            -> traiter_bloc_xml()
+            -> comparaison du snapshot
+            -> INSERT Aiven uniquement si changement réel
+
+    Aucun polling artificiel de MarketDetails.aspx n'est utilisé.
+    """
+
+    heure_onze = time(11, 0, 0)
+    heure_onze_fin = time(11, 1, 5)
+
+    heure_quatorze = time(14, 0, 0)
+    heure_quatorze_fin = time(14, 1, 5)
+
+    heure_seize = time(16, 0, 0)
+    heure_seize_fin = time(16, 1, 5)
+
+    dernier_snapshot = None
+    alertes_executees = set()
+    dernier_check_session = 0.0
+
+    # requestId -> informations de la requête MarketDetails
+    market_requests_en_cours = {}
+
+    compteur_marketdetails = 0
+
+    logger.info(
+        "Boucle de collecte événementielle démarrée."
+    )
+
+    while True:
+
+        # ----------------------------------------------------
+        # FIN IMMÉDIATE DE LA SESSION HORS CRÉNEAU
+        # ----------------------------------------------------
+
+        moment_marche = maintenant_marche()
+
+        if not est_dans_fenetre_collecte(
+            moment_marche
+        ):
+            logger.info(
+                "Fermeture de la session Selenium : "
+                "fin du créneau de collecte (%s).",
+                moment_marche.strftime(
+                    "%Y-%m-%d %H:%M:%S %Z"
+                ),
+            )
+            return
+
+        # ----------------------------------------------------
+        # VÉRIFICATION DE LA SESSION SGI
+        # ----------------------------------------------------
+
+        now_epoch = time_module.time()
+
+        if (
+            now_epoch
+            - dernier_check_session
+            >= 60
+        ):
+            assurer_connexion_sgi(
+                driver_instance
+            )
+
+            dernier_check_session = (
+                now_epoch
+            )
+
+        # ----------------------------------------------------
+        # CONTRÔLE DU STOCKAGE
+        # ----------------------------------------------------
+
+        db.check_storage_limit()
+
+        # ----------------------------------------------------
+        # CONTRÔLES PORTEFEUILLE
+        # ----------------------------------------------------
+
+        maintenant = maintenant_marche()
+
+        heure_actuelle = (
+            maintenant
+            .time()
+            .replace(tzinfo=None)
+        )
+
+        date_actuelle = maintenant.date()
+
+        fenetres_alertes = [
+            ("11H", heure_onze, heure_onze_fin),
+            ("14H", heure_quatorze, heure_quatorze_fin),
+            ("16H", heure_seize, heure_seize_fin),
+        ]
+
+        for (
+            nom_fenetre,
+            debut,
+            fin,
+        ) in fenetres_alertes:
+
+            cle = (
+                date_actuelle,
+                nom_fenetre,
+            )
+
+            if (
+                debut <= heure_actuelle <= fin
+                and cle not in alertes_executees
+            ):
+                try:
+                    signale(
+                        driver_instance
+                    )
+
+                except Exception as exc:
+                    logger.exception(
+                        "Erreur pendant le contrôle portefeuille %s : %s",
+                        nom_fenetre,
+                        exc,
+                    )
+
+                alertes_executees.add(
+                    cle
+                )
+
+        # ----------------------------------------------------
+        # LECTURE DES ÉVÉNEMENTS RÉSEAU CHROME
+        # ----------------------------------------------------
+
+        logs = driver_instance.get_log(
+            "performance"
+        )
+
+        for log in logs:
+            try:
+                message = json.loads(
+                    log["message"]
+                ).get(
+                    "message",
+                    {},
+                )
+
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                KeyError,
+            ):
+                continue
+
+            method = message.get(
+                "method"
+            )
+
+            params = message.get(
+                "params",
+                {},
+            )
+
+            # =================================================
+            # 1. MARKETDETAILS EST ENVOYÉ
+            # =================================================
+
+            if method == "Network.requestWillBeSent":
+                request = params.get(
+                    "request",
+                    {},
+                )
+
+                url = request.get(
+                    "url",
+                    "",
+                )
+
+                if "MarketDetails.aspx" not in url:
+                    continue
+
+                request_id = params.get(
+                    "requestId"
+                )
+
+                if not request_id:
+                    continue
+
+                market_requests_en_cours[
+                    request_id
+                ] = {
+                    "url": url,
+                    "method": request.get(
+                        "method",
+                        "",
+                    ),
+                    "started_at": time_module.time(),
+                    "status": None,
+                }
+
+                compteur_marketdetails += 1
+
+                logger.info(
+                    "Mise à jour marché détectée #%s | "
+                    "method=%s | requestId=%s",
+                    compteur_marketdetails,
+                    request.get(
+                        "method",
+                        "",
+                    ),
+                    request_id,
+                )
+
+                continue
+
+            # =================================================
+            # 2. LE SERVEUR A RÉPONDU
+            # =================================================
+
+            if method == "Network.responseReceived":
+                request_id = params.get(
+                    "requestId"
+                )
+
+                if request_id not in market_requests_en_cours:
+                    continue
+
+                response = params.get(
+                    "response",
+                    {},
+                )
+
+                market_requests_en_cours[
+                    request_id
+                ]["status"] = response.get(
+                    "status"
+                )
+
+                market_requests_en_cours[
+                    request_id
+                ]["mime_type"] = response.get(
+                    "mimeType"
+                )
+
+                continue
+
+            # =================================================
+            # 3. LE BODY EST DISPONIBLE
+            # =================================================
+
+            if method == "Network.loadingFinished":
+                request_id = params.get(
+                    "requestId"
+                )
+
+                requete_info = market_requests_en_cours.pop(
+                    request_id,
+                    None,
+                )
+
+                if requete_info is None:
+                    continue
+
+                status = requete_info.get(
+                    "status"
+                )
+
+                if (
+                    status is not None
+                    and not (
+                        200 <= float(status) < 300
+                    )
+                ):
+                    logger.warning(
+                        "MarketDetails terminé avec status=%s | requestId=%s",
+                        status,
+                        request_id,
+                    )
+                    continue
+
+                response_body = get_response_body(
+                    driver_instance,
+                    request_id,
+                )
+
+                if not response_body:
+                    logger.warning(
+                        "MarketDetails terminé mais body vide | requestId=%s",
+                        request_id,
+                    )
+                    continue
+
+                logger.info(
+                    "Réponse MarketDetails complète reçue | "
+                    "requestId=%s | taille=%s caractères",
+                    request_id,
+                    len(response_body),
+                )
+
+                try:
+                    dernier_snapshot = traiter_reponse_marche(
+                        response_body,
+                        dernier_snapshot,
+                    )
+
+                except Exception as exc:
+                    logger.exception(
+                        "Erreur pendant le traitement MarketDetails "
+                        "requestId=%s : %s",
+                        request_id,
+                        exc,
+                    )
+
+                continue
+
+            # =================================================
+            # 4. ÉCHEC RÉSEAU
+            # =================================================
+
+            if method == "Network.loadingFailed":
+                request_id = params.get(
+                    "requestId"
+                )
+
+                requete_info = market_requests_en_cours.pop(
+                    request_id,
+                    None,
+                )
+
+                if requete_info is None:
+                    continue
+
+                logger.warning(
+                    "Échec de chargement MarketDetails | "
+                    "requestId=%s | erreur=%s",
+                    request_id,
+                    params.get(
+                        "errorText"
+                    ),
+                )
+
+        # ----------------------------------------------------
+        # NETTOYAGE DES REQUESTIDS TROP ANCIENS
+        # ----------------------------------------------------
+
+        maintenant_epoch = time_module.time()
+
+        requests_expires = [
+            request_id
+            for request_id, info
+            in market_requests_en_cours.items()
+            if (
+                maintenant_epoch
+                - info.get(
+                    "started_at",
+                    maintenant_epoch,
+                )
+                > 60
+            )
+        ]
+
+        for request_id in requests_expires:
+            market_requests_en_cours.pop(
+                request_id,
+                None,
+            )
+
+            logger.warning(
+                "Requête MarketDetails expirée sans loadingFinished | "
+                "requestId=%s",
+                request_id,
+            )
+
+        time_module.sleep(
+            LOOP_SLEEP_SECONDS
+        )
+
+
+# ============================================================
+# 18. UNE SESSION COMPLETE CHROME + SGI
+# ============================================================
+
+def executer_session_collecte():
+    driver_instance = None
+
+    if not est_dans_fenetre_collecte():
         return
 
-    # Déterminer les en-têtes à partir du premier enregistrement
-    entetes_base = []
-    for mnemo_data in historique.values():
-        if mnemo_data:
-            first_ts_data = next(iter(mnemo_data.values()))
-            entetes_base = list(first_ts_data.keys())
-            break
-    if not entetes_base:
-        print("Aucune donnée dans l'historique de variation pour déterminer les en-têtes.")
-        return
+    try:
+        driver_instance = creer_driver()
 
-    entetes = ['mnemonique', 'horodatage_execution'] + entetes_base
+        start(
+            driver_instance
+        )
 
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                ligne = {'mnemonique': mnemonique, 'horodatage_execution': horodatage_exec}
-                ligne.update(data_exec)
-                writer.writerow(ligne)
-    print(f"Historique de variation exporté vers {nom_fichier}")
+        time_module.sleep(
+            5
+        )
+
+        assurer_connexion_sgi(
+            driver_instance
+        )
+
+        logger.info(
+            "Connexion SGI confirmée."
+        )
+
+        collecte(
+            driver_instance
+        )
+
+    finally:
+        if (
+            driver_instance is not None
+        ):
+            try:
+                driver_instance.quit()
+
+            except Exception:
+                pass
 
 
-def exporter_historique_transactions_csv(historique, nom_fichier="hist_transactions.csv"):
-    """Exporte l'historique des transactions (interprétées) en CSV."""
-    if not historique:
-        print("Historique de transactions vide, rien à exporter en CSV.")
-        return
-    
-    entetes_base = []
-    for mnemo_data in historique.values():
-        if mnemo_data:
-            first_ts_data = next(iter(mnemo_data.values()))
-            entetes_base = list(first_ts_data.keys())
-            break
-    if not entetes_base:
-        print("Aucune donnée dans l'historique de transactions pour déterminer les en-têtes.")
-        return
-        
-    entetes = ['mnemonique', 'horodatage_execution'] + entetes_base
+# ============================================================
+# 19. SUPERVISEUR RENDER
+# ============================================================
 
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                ligne = {'mnemonique': mnemonique, 'horodatage_execution': horodatage_exec}
-                ligne.update(data_exec)
-                writer.writerow(ligne)
-    print(f"Historique de transactions exporté vers {nom_fichier}")
+def main():
+    verifier_configuration()
 
-import pandas as pd
+    # Render Web Service : ouvre le port HTTP dès le démarrage.
+    demarrer_serveur_render()
 
+    logger.info(
+        "=================================================="
+    )
+    logger.info(
+        "DÉMARRAGE COLLECTEUR BRVM SUR RENDER"
+    )
+    logger.info(
+        "Destination : %s.%s",
+        AIVEN_MYSQL_DATABASE,
+        AIVEN_MYSQL_TABLE,
+    )
+    logger.info(
+        "Horaire : lundi-vendredi %s-%s | fuseau=%s",
+        COLLECT_START_TIME.strftime("%H:%M"),
+        COLLECT_END_TIME.strftime("%H:%M"),
+        COLLECT_TIMEZONE_NAME,
+    )
+    logger.info(
+        "Premier ID : %s",
+        AIVEN_FIRST_ID,
+    )
+    logger.info(
+        "Seuil stockage configuré : %.2f Mo",
+        AIVEN_MAX_STORAGE_MB,
+    )
+    logger.info(
+        "Chrome headless : %s",
+        CHROME_HEADLESS,
+    )
+    logger.info(
+        "=================================================="
+    )
+
+    while True:
+        try:
+            # Hors horaires : ni Chrome ni collecte SQL.
+            attendre_fenetre_collecte()
+
+            # Nous ne préparons Aiven qu'au moment où le marché ouvre.
+            db.test_connection()
+            db.ensure_table()
+            db.check_storage_limit(
+                force=True
+            )
+
+            logger.info(
+                "Ouverture du créneau : lancement Selenium."
+            )
+
+            executer_session_collecte()
+
+            # La fonction retourne normalement après 16h30.
+            db.close()
+
+        except StorageLimitReached as exc:
+            logger.critical(
+                "=================================================="
+            )
+            logger.critical(
+                "ARRÊT VOLONTAIRE : LIMITE DE STOCKAGE"
+            )
+            logger.critical(
+                "%s",
+                exc,
+            )
+            logger.critical(
+                "=================================================="
+            )
+
+            db.close()
+            sys.exit(99)
+
+        except KeyboardInterrupt:
+            logger.info(
+                "Arrêt manuel demandé."
+            )
+
+            db.close()
+            sys.exit(0)
+
+        except Exception as exc:
+            logger.exception(
+                "Erreur de session : %s",
+                exc,
+            )
+
+            db.close()
+
+            # Si l'erreur arrive après la fermeture du marché,
+            # on ne boucle pas inutilement sur Selenium.
+            if not est_dans_fenetre_collecte():
+                continue
+
+            logger.info(
+                "Redémarrage automatique dans %s secondes...",
+                RESTART_DELAY_SECONDS,
+            )
+
+            time_module.sleep(
+                RESTART_DELAY_SECONDS
+            )
+
+
+# ============================================================
+# 20. POINT D'ENTRÉE
+# ============================================================
+
+
+if __name__ == "__main__":
+    main()

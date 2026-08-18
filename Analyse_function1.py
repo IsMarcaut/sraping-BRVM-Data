@@ -2,9 +2,6 @@ import xml.etree.ElementTree as ET
 from pprint import pprint
 from datetime import datetime, time
 import csv
-#import pyodbc
-import winsound  # Pour Windows
-# import os      # Pour Linux et macOS (nécessite 'play' ou 'afplay')
 
 
 # --- Fonctions d'aide pour le parsing (inchangées) ---

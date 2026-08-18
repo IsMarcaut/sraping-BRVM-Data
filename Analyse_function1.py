@@ -219,7 +219,7 @@ def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
         type_msg_elem = racine.find('TYPE')
         if racine.tag != 'REP' or type_msg_elem is None or type_msg_elem.text != 'MKT':
             print(f"AVERT: Format XML racine ou TYPE inattendu.")
-            return True
+            return False
         pacq = racine.find('PACQ')
         if pacq is None:
             print("AVERT: Balise PACQ non trouvée.")

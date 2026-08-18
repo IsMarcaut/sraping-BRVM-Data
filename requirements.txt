@@ -1,0 +1,6 @@
+selenium
+PyMySQL
+python-dotenv
+cryptography
+numpy
+pandas

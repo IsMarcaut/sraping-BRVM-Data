@@ -69,7 +69,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
-from Analyse_function1 import traiter_bloc_xml
+from Analyse_function1 import *
 
 
 # ============================================================
@@ -215,6 +215,34 @@ LOOP_SLEEP_SECONDS = float(
     os.getenv(
         "LOOP_SLEEP_SECONDS",
         "0.25",
+    )
+)
+
+
+# ============================================================
+# POLLING ACTIF DES DONNEES DE MARCHE
+# ============================================================
+#
+# Le site SGI ne renvoie pas nécessairement MarketDetails.aspx
+# spontanément après la première connexion.
+#
+# Le scraper mémorise donc la requête MarketDetails.aspx observée
+# dans Chrome puis la rejoue périodiquement dans la même session.
+#
+# 2 secondes = détection quasi immédiate sans recharger toute la page.
+MARKET_POLL_SECONDS = float(
+    os.getenv(
+        "MARKET_POLL_SECONDS",
+        "2",
+    )
+)
+
+# Délai entre deux avertissements si la requête MarketDetails
+# n'a pas encore été détectée.
+MARKET_REQUEST_WARNING_SECONDS = int(
+    os.getenv(
+        "MARKET_REQUEST_WARNING_SECONDS",
+        "30",
     )
 )
 
@@ -399,6 +427,12 @@ def verifier_configuration():
     if OUTSIDE_WINDOW_CHECK_SECONDS < 5:
         raise RuntimeError(
             "OUTSIDE_WINDOW_CHECK_SECONDS doit être >= 5."
+        )
+
+
+    if MARKET_POLL_SECONDS < 0.5:
+        raise RuntimeError(
+            "MARKET_POLL_SECONDS doit être >= 0.5 seconde."
         )
 
     if AIVEN_CA_CERT:
@@ -1374,6 +1408,12 @@ def creer_driver():
         25
     )
 
+    # Timeout utilisé par execute_async_script() pour rejouer
+    # la requête MarketDetails.aspx dans le navigateur.
+    driver_instance.set_script_timeout(
+        30
+    )
+
     driver_instance.implicitly_wait(
         2
     )
@@ -1587,8 +1627,213 @@ def get_response_body(
         return None
 
 
+
 # ============================================================
-# 14. ALERTES PORTEFEUILLE
+# 14. POLLING ACTIF DE MARKETDETAILS.ASPX
+# ============================================================
+
+def _headers_fetch_autorises(headers):
+    """
+    Une requête Chrome contient beaucoup de headers que JavaScript
+    n'a pas le droit de définir manuellement (Host, Cookie,
+    Content-Length, Origin, Sec-*, etc.).
+
+    On ne conserve que les headers utiles au replay de la requête.
+    Les cookies de session SGI sont repris automatiquement grâce à
+    credentials="include".
+    """
+
+    if not isinstance(headers, dict):
+        return {}
+
+    resultat = {}
+
+    for cle, valeur in headers.items():
+        nom = str(cle).lower().strip()
+
+        if (
+            nom in {
+                "accept",
+                "content-type",
+                "x-requested-with",
+            }
+            or nom.startswith("x-")
+        ):
+            resultat[str(cle)] = str(valeur)
+
+    return resultat
+
+
+def extraire_requete_marketdetails(message):
+    """
+    Extrait la vraie requête MarketDetails.aspx depuis l'événement
+    Chrome Network.requestWillBeSent.
+
+    La requête capturée sera ensuite rejouée périodiquement sans
+    recharger toute la page.
+    """
+
+    if (
+        message.get("method")
+        != "Network.requestWillBeSent"
+    ):
+        return None
+
+    params = message.get(
+        "params",
+        {},
+    )
+
+    request = params.get(
+        "request",
+        {},
+    )
+
+    url = request.get(
+        "url",
+        "",
+    )
+
+    if (
+        "MarketDetails.aspx"
+        not in url
+    ):
+        return None
+
+    methode = (
+        request.get(
+            "method",
+            "GET",
+        )
+        or "GET"
+    ).upper()
+
+    return {
+        "url": url,
+        "method": methode,
+        "postData": request.get(
+            "postData"
+        ),
+        "headers": _headers_fetch_autorises(
+            request.get(
+                "headers",
+                {},
+            )
+        ),
+    }
+
+
+def rejouer_requete_marketdetails(
+    driver_instance,
+    market_request,
+):
+    """
+    Rejoue MarketDetails.aspx DIRECTEMENT depuis le navigateur.
+
+    Avantages :
+    - conserve la session/cookies SGI ;
+    - ne recharge pas toute l'interface ;
+    - récupère les données fraîches ;
+    - fonctionne même si le site ne déclenche plus spontanément
+      de nouvelle requête après la connexion.
+    """
+
+    if not market_request:
+        return None
+
+    script = r"""
+        const url = arguments[0];
+        const method = arguments[1];
+        const postData = arguments[2];
+        const headers = arguments[3];
+        const done = arguments[arguments.length - 1];
+
+        const options = {
+            method: method,
+            credentials: "include",
+            cache: "no-store",
+            headers: headers || {}
+        };
+
+        if (
+            method !== "GET" &&
+            method !== "HEAD" &&
+            postData !== null &&
+            postData !== undefined
+        ) {
+            options.body = postData;
+        }
+
+        fetch(url, options)
+            .then(async response => {
+                const body = await response.text();
+
+                done({
+                    ok: response.ok,
+                    status: response.status,
+                    url: response.url,
+                    body: body
+                });
+            })
+            .catch(error => {
+                done({
+                    ok: false,
+                    status: 0,
+                    error: String(error),
+                    body: null
+                });
+            });
+    """
+
+    try:
+        resultat = driver_instance.execute_async_script(
+            script,
+            market_request["url"],
+            market_request["method"],
+            market_request.get(
+                "postData"
+            ),
+            market_request.get(
+                "headers",
+                {},
+            ),
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "Impossible de rejouer MarketDetails.aspx : %s",
+            exc,
+        )
+        return None
+
+    if not isinstance(
+        resultat,
+        dict,
+    ):
+        return None
+
+    if not resultat.get(
+        "ok"
+    ):
+        logger.warning(
+            "Polling MarketDetails refusé | status=%s | erreur=%s",
+            resultat.get("status"),
+            resultat.get("error"),
+        )
+        return None
+
+    body = resultat.get(
+        "body"
+    )
+
+    if not body:
+        return None
+
+    return body
+
+
+# ============================================================
+# 15. ALERTES PORTEFEUILLE
 # ============================================================
 
 def _normaliser_float(value):
@@ -1754,7 +1999,7 @@ def signale(
 
 
 # ============================================================
-# 15. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
+# 16. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
 # ============================================================
 
 def limiter_historique_par_instrument(historique):
@@ -1802,8 +2047,51 @@ def nettoyer_historiques_memoire():
 
 
 # ============================================================
-# 16. TRAITEMENT DES RÉPONSES MARCHÉ
+# 17. TRAITEMENT DES RÉPONSES MARCHÉ
 # ============================================================
+
+def determiner_instruments_modifies(
+    snapshot_actuel,
+    dernier_snapshot,
+):
+    """
+    Première collecte :
+        -> tous les instruments sont enregistrés.
+
+    Collectes suivantes :
+        -> uniquement les instruments dont les données ont changé.
+
+    Cela évite de remplir Aiven avec 50/100 lignes identiques
+    lorsqu'un seul titre a changé.
+    """
+
+    if dernier_snapshot is None:
+        return copy.deepcopy(
+            snapshot_actuel
+        )
+
+    modifications = {}
+
+    for cle_instrument, donnees in snapshot_actuel.items():
+
+        anciennes_donnees = (
+            dernier_snapshot.get(
+                cle_instrument
+            )
+        )
+
+        if (
+            anciennes_donnees
+            != donnees
+        ):
+            modifications[
+                cle_instrument
+            ] = copy.deepcopy(
+                donnees
+            )
+
+    return modifications
+
 
 def traiter_reponse_marche(
     response_body,
@@ -1837,21 +2125,36 @@ def traiter_reponse_marche(
     if not snapshot_actuel:
         return dernier_snapshot
 
-    if (
-        dernier_snapshot is not None
-        and snapshot_actuel == dernier_snapshot
-    ):
-        return dernier_snapshot
+    instruments_modifies = (
+        determiner_instruments_modifies(
+            snapshot_actuel,
+            dernier_snapshot,
+        )
+    )
 
+    if not instruments_modifies:
+        logger.debug(
+            "MarketDetails reçu mais aucune modification réelle."
+        )
+
+        return snapshot_actuel
+
+    logger.info(
+        "%s instrument(s) modifié(s) détecté(s).",
+        len(instruments_modifies),
+    )
+
+    # IMPORTANT :
+    # On n'insère désormais que les lignes modifiées.
     db.insert_market_snapshot(
-        snapshot_actuel
+        instruments_modifies
     )
 
     return snapshot_actuel
 
 
 # ============================================================
-# 17. BOUCLE DE COLLECTE
+# 18. BOUCLE DE COLLECTE
 # ============================================================
 
 def collecte(
@@ -1894,16 +2197,34 @@ def collecte(
     )
 
     dernier_snapshot = None
+
     alertes_executees = set()
+
     dernier_check_session = 0.0
 
+    # Requête HTTP réellement utilisée par le site
+    # pour récupérer les données BRVM.
+    market_request = None
+
+    # Dernier polling actif.
+    dernier_poll_marche = 0.0
+
+    # Evite de répéter le même warning chaque tour.
+    dernier_warning_requete = 0.0
+
     logger.info(
-        "Boucle de collecte démarrée."
+        "Boucle de collecte continue démarrée."
+    )
+
+    logger.info(
+        "Polling marché configuré toutes les %.2f secondes.",
+        MARKET_POLL_SECONDS,
     )
 
     while True:
+
         # ----------------------------------------------------
-        # FIN IMMÉDIATE DE LA SESSION HORS CRÉNEAU
+        # FIN DE LA SESSION HORS CRÉNEAU
         # ----------------------------------------------------
 
         moment_marche = maintenant_marche()
@@ -1918,13 +2239,14 @@ def collecte(
                     "%Y-%m-%d %H:%M:%S %Z"
                 ),
             )
+
             return
 
-        # ----------------------------------------------------
-        # Vérifie la session SGI toutes les 60 secondes
-        # ----------------------------------------------------
-
         now_epoch = time_module.time()
+
+        # ----------------------------------------------------
+        # VÉRIFICATION SESSION SGI
+        # ----------------------------------------------------
 
         if (
             now_epoch
@@ -1940,19 +2262,25 @@ def collecte(
             )
 
         # ----------------------------------------------------
-        # Contrôle périodique du stockage même si le marché
-        # n'envoie pas de nouvelles données
+        # CONTRÔLE STOCKAGE
         # ----------------------------------------------------
 
         db.check_storage_limit()
 
         # ----------------------------------------------------
-        # Contrôles portefeuille aux heures prévues
+        # ALERTES PORTEFEUILLE
         # ----------------------------------------------------
 
         maintenant = maintenant_marche()
 
-        heure_actuelle = maintenant.time().replace(tzinfo=None)
+        heure_actuelle = (
+            maintenant
+            .time()
+            .replace(
+                tzinfo=None
+            )
+        )
+
         date_actuelle = maintenant.date()
 
         fenetres_alertes = [
@@ -1998,7 +2326,8 @@ def collecte(
 
                 except Exception as exc:
                     logger.exception(
-                        "Erreur pendant le contrôle portefeuille %s : %s",
+                        "Erreur pendant le contrôle "
+                        "portefeuille %s : %s",
                         nom_fenetre,
                         exc,
                     )
@@ -2008,7 +2337,7 @@ def collecte(
                 )
 
         # ----------------------------------------------------
-        # Lecture des événements réseau Chrome
+        # ÉVÉNEMENTS RÉSEAU CHROME
         # ----------------------------------------------------
 
         logs = driver_instance.get_log(
@@ -2016,6 +2345,7 @@ def collecte(
         )
 
         for log in logs:
+
             try:
                 message = json.loads(
                     log["message"]
@@ -2031,8 +2361,58 @@ def collecte(
             ):
                 continue
 
+            method = message.get(
+                "method"
+            )
+
+            # =================================================
+            # 1. MEMORISATION DE LA REQUETE MARKETDETAILS
+            # =================================================
+
             if (
-                message.get("method")
+                method
+                == "Network.requestWillBeSent"
+            ):
+                requete_detectee = (
+                    extraire_requete_marketdetails(
+                        message
+                    )
+                )
+
+                if requete_detectee:
+
+                    # On ne logue à INFO que la première fois ou
+                    # si l'URL / méthode change.
+                    if (
+                        market_request is None
+                        or market_request.get("url")
+                        != requete_detectee.get("url")
+                        or market_request.get("method")
+                        != requete_detectee.get("method")
+                    ):
+                        logger.info(
+                            "Requête MarketDetails capturée | "
+                            "method=%s | url=%s",
+                            requete_detectee.get(
+                                "method"
+                            ),
+                            requete_detectee.get(
+                                "url"
+                            ),
+                        )
+
+                    market_request = (
+                        requete_detectee
+                    )
+
+                continue
+
+            # =================================================
+            # 2. TRAITEMENT DES REPONSES SPONTANEES DU SITE
+            # =================================================
+
+            if (
+                method
                 != "Network.responseReceived"
             ):
                 continue
@@ -2075,6 +2455,10 @@ def collecte(
             if not response_body:
                 continue
 
+            logger.debug(
+                "Réponse MarketDetails spontanée reçue."
+            )
+
             dernier_snapshot = (
                 traiter_reponse_marche(
                     response_body,
@@ -2082,13 +2466,69 @@ def collecte(
                 )
             )
 
+        # ----------------------------------------------------
+        # 3. POLLING ACTIF
+        # ----------------------------------------------------
+        #
+        # Même si le site ne produit plus d'événement réseau,
+        # nous rejouons la requête MarketDetails dans la session
+        # authentifiée toutes les MARKET_POLL_SECONDS.
+        # ----------------------------------------------------
+
+        now_epoch = time_module.time()
+
+        if market_request is not None:
+
+            if (
+                now_epoch
+                - dernier_poll_marche
+                >= MARKET_POLL_SECONDS
+            ):
+                dernier_poll_marche = (
+                    now_epoch
+                )
+
+                response_body = (
+                    rejouer_requete_marketdetails(
+                        driver_instance,
+                        market_request,
+                    )
+                )
+
+                if response_body:
+
+                    dernier_snapshot = (
+                        traiter_reponse_marche(
+                            response_body,
+                            dernier_snapshot,
+                        )
+                    )
+
+        else:
+
+            if (
+                now_epoch
+                - dernier_warning_requete
+                >= MARKET_REQUEST_WARNING_SECONDS
+            ):
+                dernier_warning_requete = (
+                    now_epoch
+                )
+
+                logger.warning(
+                    "La requête MarketDetails.aspx "
+                    "n'a pas encore été détectée. "
+                    "Le scraper continue d'écouter "
+                    "les événements réseau Chrome."
+                )
+
         time_module.sleep(
             LOOP_SLEEP_SECONDS
         )
 
 
 # ============================================================
-# 18. UNE SESSION COMPLETE CHROME + SGI
+# 19. UNE SESSION COMPLETE CHROME + SGI
 # ============================================================
 
 def executer_session_collecte():
@@ -2132,7 +2572,7 @@ def executer_session_collecte():
 
 
 # ============================================================
-# 19. SUPERVISEUR RENDER
+# 20. SUPERVISEUR RENDER
 # ============================================================
 
 def main():
@@ -2245,7 +2685,7 @@ def main():
 
 
 # ============================================================
-# 20. POINT D'ENTRÉE
+# 21. POINT D'ENTRÉE
 # ============================================================
 
 

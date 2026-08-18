@@ -1,43 +1,43 @@
 """
-scraping_brvm_aiven_24h.py
-==========================
+scraping_brvm_render_aiven.py
+=============================
 
-Collecte BRVM -> Aiven for MySQL (defaultdb) sur Render.
+Adaptation Render + Aiven du scraper local brvmscraping1.py.
 
-Fonctionnement :
-1. Ouvre Chrome en mode headless.
-2. Se connecte au site SGI.
-3. Intercepte les réponses Network contenant "MarketDetails.aspx".
-4. Utilise traiter_bloc_xml() depuis Analyse_function1.py.
-5. Enregistre DIRECTEMENT les données dans Aiven for MySQL.
-6. Chaque champ simple du dictionnaire possède sa propre colonne SQL.
-7. carnet_ordres reste en JSON.
-8. Le premier ID est configuré à 99000000000.
-9. La connexion Aiven est persistante et se reconnecte automatiquement.
-10. La collecte est autorisée uniquement du lundi au vendredi, de 10h00 à 16h30.
-11. Les horaires sont évalués dans le fuseau COLLECT_TIMEZONE (par défaut Africa/Porto-Novo).
-12. Hors créneau, Selenium n'est pas lancé et aucune donnée de marché n'est écrite.
-13. Un mini serveur HTTP /health est lancé pour que le script puisse être déployé comme Web Service Render.
-14. Le script redémarre sa session Selenium après une erreur.
-15. La taille de defaultdb est contrôlée périodiquement.
-16. Lorsque le seuil configuré est atteint, le programme s'arrête avec le code 99.
+PRINCIPE IMPORTANT
+------------------
+La logique de collecte reste celle qui fonctionne en local :
 
-Dépendances :
-    pip install selenium pymysql python-dotenv cryptography
+    driver.get_log("performance")
+            ↓
+    Network.responseReceived
+            ↓
+    URL contient MarketDetails.aspx
+            ↓
+    Network.getResponseBody(requestId)
+            ↓
+    traiter_bloc_xml(...)
+            ↓
+    insertion Aiven
 
-Fichiers attendus dans le même dossier :
-    scraping_brvm_aiven_24h.py
-    Analyse_function1.py
-    .env
-    ca.pem
+AUCUN polling artificiel de MarketDetails.aspx.
+AUCUN replay fetch().
+Le site SGI reste maître du rythme des mises à jour.
 
-IMPORTANT :
-    - Ce script N'UTILISE PAS Collecte_data_BRVM().
-    - Il utilise seulement traiter_bloc_xml().
+Différences nécessaires pour Render :
+- Chrome/Chromium headless ;
+- credentials dans les variables d'environnement ;
+- mini serveur HTTP /health ;
+- collecte lundi-vendredi, 10h00-16h30 Bénin ;
+- connexion Aiven MySQL / defaultdb ;
+- reconnexion automatique ;
+- retries courts sur getResponseBody ;
+- fallback sur Network.loadingFinished si le body n'est pas encore
+  disponible au moment de responseReceived ;
+- pas de dépendance pyodbc/SQL Server/Windows.
 """
 
 import base64
-import copy
 import json
 import logging
 import math
@@ -57,34 +57,32 @@ from zoneinfo import ZoneInfo
 
 import pymysql
 from dotenv import load_dotenv
+
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
-    WebDriverException,
     TimeoutException,
+    WebDriverException,
 )
-
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-from Analyse_function1 import *
+from Analyse_function1_render import traiter_bloc_xml
 
 
 # ============================================================
-# 1. DOSSIERS ET .ENV
+# 1. DOSSIER / ENV
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_FILE = BASE_DIR / ".env"
-
-load_dotenv(ENV_FILE)
+load_dotenv(BASE_DIR / ".env")
 
 
 # ============================================================
-# 2. CONFIGURATION SGI
+# 2. SGI
 # ============================================================
 
 SGI_BASE_URL = os.getenv(
@@ -92,48 +90,71 @@ SGI_BASE_URL = os.getenv(
     "https://myaccount.sgibenin.com/index.html",
 ).strip()
 
-SGI_LOGIN = os.getenv("SGI_LOGIN", "").strip()
-SGI_PASSWORD = os.getenv("SGI_PASSWORD", "")
+SGI_LOGIN = os.getenv(
+    "SGI_LOGIN",
+    "",
+).strip()
+
+SGI_PASSWORD = os.getenv(
+    "SGI_PASSWORD",
+    "",
+)
 
 
 # ============================================================
-# 3. CONFIGURATION AIVEN
+# 3. AIVEN
 # ============================================================
 
 AIVEN_MYSQL_HOST = os.getenv(
     "AIVEN_MYSQL_HOST",
     "",
-).strip()
+).strip().strip('"').strip("'")
 
 AIVEN_MYSQL_PORT = os.getenv(
     "AIVEN_MYSQL_PORT",
     "",
-).strip()
+).strip().strip('"').strip("'")
 
 AIVEN_MYSQL_USER = os.getenv(
     "AIVEN_MYSQL_USER",
     "",
-).strip()
+).strip().strip('"').strip("'")
 
 AIVEN_MYSQL_PASSWORD = os.getenv(
     "AIVEN_MYSQL_PASSWORD",
     "",
 )
 
-AIVEN_MYSQL_DATABASE = os.getenv(
-    "AIVEN_MYSQL_DATABASE",
-    "defaultdb",
-).strip() or "defaultdb"
+AIVEN_MYSQL_DATABASE = (
+    os.getenv(
+        "AIVEN_MYSQL_DATABASE",
+        "defaultdb",
+    )
+    .strip()
+    .strip('"')
+    .strip("'")
+    or "defaultdb"
+)
 
-AIVEN_CA_CERT = os.getenv(
-    "AIVEN_CA_CERT",
-    "ca.pem",
-).strip()
+AIVEN_CA_CERT = (
+    os.getenv(
+        "AIVEN_CA_CERT",
+        "/etc/secrets/ca.pem",
+    )
+    .strip()
+    .strip('"')
+    .strip("'")
+)
 
-AIVEN_MYSQL_TABLE = os.getenv(
-    "AIVEN_MYSQL_TABLE",
-    "brvm_market_data",
-).strip()
+AIVEN_MYSQL_TABLE = (
+    os.getenv(
+        "AIVEN_MYSQL_TABLE",
+        "brvm_market_data",
+    )
+    .strip()
+    .strip('"')
+    .strip("'")
+)
 
 AIVEN_FIRST_ID = int(
     os.getenv(
@@ -147,8 +168,6 @@ AIVEN_FIRST_ID = int(
 # 4. HORAIRES DE COLLECTE
 # ============================================================
 
-# Render utilise souvent UTC côté serveur. On ne dépend donc jamais
-# de l'heure locale de la machine Render.
 COLLECT_TIMEZONE_NAME = os.getenv(
     "COLLECT_TIMEZONE",
     "Africa/Porto-Novo",
@@ -158,33 +177,16 @@ COLLECT_TIMEZONE = ZoneInfo(
     COLLECT_TIMEZONE_NAME
 )
 
-COLLECT_START_HOUR = int(
-    os.getenv("COLLECT_START_HOUR", "10")
-)
-
-COLLECT_START_MINUTE = int(
-    os.getenv("COLLECT_START_MINUTE", "0")
-)
-
-COLLECT_END_HOUR = int(
-    os.getenv("COLLECT_END_HOUR", "16")
-)
-
-COLLECT_END_MINUTE = int(
-    os.getenv("COLLECT_END_MINUTE", "30")
-)
-
 COLLECT_START_TIME = time(
-    COLLECT_START_HOUR,
-    COLLECT_START_MINUTE,
+    int(os.getenv("COLLECT_START_HOUR", "10")),
+    int(os.getenv("COLLECT_START_MINUTE", "0")),
 )
 
 COLLECT_END_TIME = time(
-    COLLECT_END_HOUR,
-    COLLECT_END_MINUTE,
+    int(os.getenv("COLLECT_END_HOUR", "16")),
+    int(os.getenv("COLLECT_END_MINUTE", "30")),
 )
 
-# Délai de vérification hors marché.
 OUTSIDE_WINDOW_CHECK_SECONDS = int(
     os.getenv(
         "OUTSIDE_WINDOW_CHECK_SECONDS",
@@ -194,7 +196,7 @@ OUTSIDE_WINDOW_CHECK_SECONDS = int(
 
 
 # ============================================================
-# 5. PARAMÈTRES DE FONCTIONNEMENT
+# 5. SELENIUM / ROBUSTESSE
 # ============================================================
 
 CHROME_HEADLESS = (
@@ -205,6 +207,23 @@ CHROME_HEADLESS = (
     in {"1", "true", "yes", "oui"}
 )
 
+CHROME_BIN = os.getenv(
+    "CHROME_BIN",
+    "/usr/bin/chromium",
+).strip()
+
+CHROMEDRIVER_PATH = os.getenv(
+    "CHROMEDRIVER_PATH",
+    "/usr/bin/chromedriver",
+).strip()
+
+LOOP_SLEEP_SECONDS = float(
+    os.getenv(
+        "LOOP_SLEEP_SECONDS",
+        "0.10",
+    )
+)
+
 RESTART_DELAY_SECONDS = int(
     os.getenv(
         "RESTART_DELAY_SECONDS",
@@ -212,12 +231,34 @@ RESTART_DELAY_SECONDS = int(
     )
 )
 
-LOOP_SLEEP_SECONDS = float(
+SESSION_CHECK_SECONDS = int(
     os.getenv(
-        "LOOP_SLEEP_SECONDS",
-        "0.25",
+        "SESSION_CHECK_SECONDS",
+        "60",
     )
 )
+
+# Le code local appelle getResponseBody immédiatement.
+# Sur Render, le serveur peut être légèrement plus lent.
+# Ces retries gardent la logique locale tout en la fiabilisant.
+RESPONSE_BODY_RETRIES = int(
+    os.getenv(
+        "RESPONSE_BODY_RETRIES",
+        "6",
+    )
+)
+
+RESPONSE_BODY_RETRY_DELAY = float(
+    os.getenv(
+        "RESPONSE_BODY_RETRY_DELAY",
+        "0.15",
+    )
+)
+
+
+# ============================================================
+# 6. MYSQL / STOCKAGE
+# ============================================================
 
 DB_CONNECT_TIMEOUT = int(
     os.getenv(
@@ -240,8 +281,6 @@ DB_WRITE_TIMEOUT = int(
     )
 )
 
-# Seuil de sécurité configurable.
-# Ce contrôle mesure la taille logique tables + index de defaultdb.
 AIVEN_MAX_STORAGE_MB = float(
     os.getenv(
         "AIVEN_MAX_STORAGE_MB",
@@ -257,8 +296,20 @@ STORAGE_CHECK_INTERVAL_SECONDS = int(
 )
 
 
-# Nombre maximal d'entrées historiques conservées en mémoire
-# par instrument. Cela évite une croissance RAM illimitée en 24/7.
+# ============================================================
+# 7. LIMITES MEMOIRE
+# ============================================================
+
+MAX_RAW_RESPONSES_IN_MEMORY = int(
+    os.getenv(
+        "MAX_RAW_RESPONSES_IN_MEMORY",
+        "200",
+    )
+)
+
+# Les historiques spécialisés du parseur local grandissent à chaque
+# mise à jour. Sur Render, on borne uniquement la RAM ; le cache courant
+# et les insertions Aiven restent inchangés.
 MAX_HISTORY_PER_INSTRUMENT = int(
     os.getenv(
         "MAX_HISTORY_PER_INSTRUMENT",
@@ -266,24 +317,28 @@ MAX_HISTORY_PER_INSTRUMENT = int(
     )
 )
 
-# Nombre maximal de réponses brutes conservées en RAM.
-MAX_RAW_RESPONSES_IN_MEMORY = int(
+MAX_PENDING_REQUESTS = int(
     os.getenv(
-        "MAX_RAW_RESPONSES_IN_MEMORY",
+        "MAX_PENDING_REQUESTS",
         "500",
     )
 )
 
 
-
 # ============================================================
-# 6. LOGS
+# 8. LOGGING
 # ============================================================
 
 LOG_FILE = BASE_DIR / "collecte_brvm.log"
 
-logger = logging.getLogger("BRVM_AIVEN_24H")
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(
+    "BRVM_RENDER_AIVEN"
+)
+
+logger.setLevel(
+    logging.INFO
+)
+
 logger.propagate = False
 
 if not logger.handlers:
@@ -292,144 +347,153 @@ if not logger.handlers:
     )
 
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    console_handler.setFormatter(
+        formatter
+    )
 
     file_handler = RotatingFileHandler(
         LOG_FILE,
         maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        backupCount=3,
         encoding="utf-8",
     )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+
+    file_handler.setFormatter(
+        formatter
+    )
+
+    logger.addHandler(
+        console_handler
+    )
+
+    logger.addHandler(
+        file_handler
+    )
 
 
 # ============================================================
-# 7. EXCEPTION SPÉCIALE POUR LA LIMITE DE STOCKAGE
+# 9. ETAT RUNTIME / HEALTH
 # ============================================================
 
-class StorageLimitReached(RuntimeError):
+runtime_state = {
+    "market_events_seen": 0,
+    "market_bodies_processed": 0,
+    "rows_inserted": 0,
+    "last_market_event_at": None,
+    "last_insert_at": None,
+    "last_error": None,
+}
+
+
+# ============================================================
+# 10. EXCEPTIONS
+# ============================================================
+
+class StorageLimitReached(
+    RuntimeError
+):
     pass
 
 
-
 # ============================================================
-# 8. VALIDATION DE LA CONFIGURATION
+# 11. VALIDATION
 # ============================================================
 
 def verifier_configuration():
+
     manquants = []
 
-    if not SGI_LOGIN:
-        manquants.append("SGI_LOGIN")
-
-    if not SGI_PASSWORD:
-        manquants.append("SGI_PASSWORD")
-
-    if not AIVEN_MYSQL_HOST:
-        manquants.append("AIVEN_MYSQL_HOST")
-
-    if not AIVEN_MYSQL_PORT:
-        manquants.append("AIVEN_MYSQL_PORT")
-
-    if not AIVEN_MYSQL_USER:
-        manquants.append("AIVEN_MYSQL_USER")
-
-    if not AIVEN_MYSQL_PASSWORD:
-        manquants.append("AIVEN_MYSQL_PASSWORD")
+    for nom, valeur in [
+        ("SGI_LOGIN", SGI_LOGIN),
+        ("SGI_PASSWORD", SGI_PASSWORD),
+        ("AIVEN_MYSQL_HOST", AIVEN_MYSQL_HOST),
+        ("AIVEN_MYSQL_PORT", AIVEN_MYSQL_PORT),
+        ("AIVEN_MYSQL_USER", AIVEN_MYSQL_USER),
+        ("AIVEN_MYSQL_PASSWORD", AIVEN_MYSQL_PASSWORD),
+    ]:
+        if not valeur:
+            manquants.append(
+                nom
+            )
 
     if manquants:
         raise RuntimeError(
-            "Paramètres manquants dans .env : "
-            + ", ".join(manquants)
+            "Variables Render manquantes : "
+            + ", ".join(
+                manquants
+            )
         )
 
-    if "://" in AIVEN_MYSQL_HOST:
+    # Un hostname doit être un hostname, pas une URI Aiven.
+    if (
+        "://" in AIVEN_MYSQL_HOST
+        or "@" in AIVEN_MYSQL_HOST
+        or "/" in AIVEN_MYSQL_HOST
+        or "?" in AIVEN_MYSQL_HOST
+        or ":" in AIVEN_MYSQL_HOST
+    ):
         raise RuntimeError(
-            "AIVEN_MYSQL_HOST doit contenir uniquement le hostname, "
-            "pas l'URI mysql:// complète."
+            "AIVEN_MYSQL_HOST doit contenir uniquement "
+            "le hostname Aiven."
         )
 
-    try:
-        port = int(AIVEN_MYSQL_PORT)
-    except ValueError as exc:
-        raise RuntimeError(
-            "AIVEN_MYSQL_PORT doit être un entier."
-        ) from exc
-
-    if not (1 <= port <= 65535):
-        raise RuntimeError(
-            "AIVEN_MYSQL_PORT est hors plage."
-        )
+    int(
+        AIVEN_MYSQL_PORT
+    )
 
     if not re.fullmatch(
         r"[A-Za-z0-9_]+",
         AIVEN_MYSQL_TABLE,
     ):
         raise RuntimeError(
-            "AIVEN_MYSQL_TABLE doit contenir uniquement "
-            "lettres, chiffres et underscores."
+            "Nom de table Aiven invalide."
         )
 
-    if AIVEN_FIRST_ID < 1:
+    ca_path = Path(
+        AIVEN_CA_CERT
+    )
+
+    if not ca_path.is_absolute():
+        ca_path = (
+            BASE_DIR
+            / ca_path
+        )
+
+    if not ca_path.exists():
         raise RuntimeError(
-            "AIVEN_FIRST_ID doit être supérieur à 0."
+            f"Certificat CA introuvable : {ca_path}"
         )
-
-    if AIVEN_MAX_STORAGE_MB <= 0:
-        raise RuntimeError(
-            "AIVEN_MAX_STORAGE_MB doit être supérieur à 0."
-        )
-
-    if not (
-        0 <= COLLECT_START_HOUR <= 23
-        and 0 <= COLLECT_END_HOUR <= 23
-        and 0 <= COLLECT_START_MINUTE <= 59
-        and 0 <= COLLECT_END_MINUTE <= 59
-    ):
-        raise RuntimeError(
-            "Les horaires de collecte sont invalides."
-        )
-
-    if COLLECT_START_TIME >= COLLECT_END_TIME:
-        raise RuntimeError(
-            "L'heure de début doit être antérieure à l'heure de fin."
-        )
-
-    if OUTSIDE_WINDOW_CHECK_SECONDS < 5:
-        raise RuntimeError(
-            "OUTSIDE_WINDOW_CHECK_SECONDS doit être >= 5."
-        )
-
-    if AIVEN_CA_CERT:
-        ca_path = Path(AIVEN_CA_CERT).expanduser()
-
-        if not ca_path.is_absolute():
-            ca_path = BASE_DIR / ca_path
-
-        if not ca_path.exists():
-            raise RuntimeError(
-                f"Certificat CA introuvable : {ca_path}"
-            )
 
 
 # ============================================================
-# 9. CONVERSIONS DE DONNÉES
+# 12. CONVERSIONS MYSQL
 # ============================================================
 
-def convertir_decimal(value):
+def convertir_decimal(
+    value,
+):
     if value is None:
         return None
 
-    if isinstance(value, Decimal):
+    if isinstance(
+        value,
+        Decimal,
+    ):
         return value
 
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
+    if isinstance(
+        value,
+        float,
+    ):
+        if (
+            math.isnan(value)
+            or math.isinf(value)
+        ):
             return None
 
-    text = str(value).strip()
+    text = str(
+        value
+    ).strip()
 
     if not text:
         return None
@@ -440,6 +504,7 @@ def convertir_decimal(value):
         "nan",
         "n/a",
         "na",
+        "-",
     }:
         return None
 
@@ -452,34 +517,32 @@ def convertir_decimal(value):
     )
 
     try:
-        return Decimal(text)
+        return Decimal(
+            text
+        )
 
     except InvalidOperation:
-        logger.warning(
-            "Valeur décimale non convertible : %r",
-            value,
-        )
         return None
 
 
-def convertir_entier(value):
-    decimal_value = convertir_decimal(value)
+def convertir_entier(
+    value,
+):
+    decimal_value = (
+        convertir_decimal(
+            value
+        )
+    )
 
     if decimal_value is None:
         return None
 
     try:
-        return int(decimal_value)
-
-    except (
-        ValueError,
-        TypeError,
-        OverflowError,
-    ):
-        logger.warning(
-            "Valeur entière non convertible : %r",
-            value,
+        return int(
+            decimal_value
         )
+
+    except Exception:
         return None
 
 
@@ -490,50 +553,63 @@ def convertir_texte(
     if value is None:
         return None
 
-    text = str(value).strip()
+    text = str(
+        value
+    ).strip()
 
-    if max_length is not None:
-        return text[:max_length]
+    if max_length:
+        text = text[
+            :max_length
+        ]
 
     return text
 
 
-def convertir_json(value):
-    if value is None:
-        value = []
-
+def convertir_json(
+    value,
+):
     return json.dumps(
-        value,
+        value or [],
         ensure_ascii=False,
         default=str,
     )
 
 
 # ============================================================
-# 10. CLIENT AIVEN
+# 13. AIVEN MYSQL
 # ============================================================
 
 class AivenMySQLClient:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ):
         self.connection = None
         self.last_storage_check = 0.0
-        self.last_storage_size_mb = 0.0
 
-    def _ssl_configuration(self):
+    def _ssl(
+        self,
+    ):
         ca_path = Path(
             AIVEN_CA_CERT
-        ).expanduser()
+        )
 
         if not ca_path.is_absolute():
-            ca_path = BASE_DIR / ca_path
+            ca_path = (
+                BASE_DIR
+                / ca_path
+            )
 
         return {
-            "ca": str(ca_path),
+            "ca": str(
+                ca_path
+            ),
             "check_hostname": True,
         }
 
-    def connect(self):
+    def connect(
+        self,
+    ):
         self.close()
 
         logger.info(
@@ -547,7 +623,9 @@ class AivenMySQLClient:
 
         self.connection = pymysql.connect(
             host=AIVEN_MYSQL_HOST,
-            port=int(AIVEN_MYSQL_PORT),
+            port=int(
+                AIVEN_MYSQL_PORT
+            ),
             user=AIVEN_MYSQL_USER,
             password=AIVEN_MYSQL_PASSWORD,
             database=AIVEN_MYSQL_DATABASE,
@@ -557,16 +635,18 @@ class AivenMySQLClient:
             read_timeout=DB_READ_TIMEOUT,
             write_timeout=DB_WRITE_TIMEOUT,
             cursorclass=pymysql.cursors.DictCursor,
-            ssl=self._ssl_configuration(),
+            ssl=self._ssl(),
         )
 
         logger.info(
-            "Connexion Aiven for MySQL établie."
+            "Connexion Aiven établie."
         )
 
         return self.connection
 
-    def ensure_connection(self):
+    def ensure_connection(
+        self,
+    ):
         if self.connection is None:
             return self.connect()
 
@@ -576,16 +656,16 @@ class AivenMySQLClient:
             )
 
         except Exception:
-            logger.exception(
-                "Connexion Aiven perdue. Reconnexion."
-            )
-
             return self.connect()
 
         return self.connection
 
-    def test_connection(self):
-        connection = self.ensure_connection()
+    def test_connection(
+        self,
+    ):
+        connection = (
+            self.ensure_connection()
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -600,63 +680,53 @@ class AivenMySQLClient:
             result = cursor.fetchone()
 
         logger.info(
-            "Test Aiven réussi | MySQL=%s | Base=%s | User=%s",
-            result.get("mysql_version"),
-            result.get("database_name"),
-            result.get("connected_user"),
+            "Aiven OK | MySQL=%s | Base=%s | User=%s",
+            result.get(
+                "mysql_version"
+            ),
+            result.get(
+                "database_name"
+            ),
+            result.get(
+                "connected_user"
+            ),
         )
 
-        if (
-            result.get("database_name")
-            != AIVEN_MYSQL_DATABASE
-        ):
-            raise RuntimeError(
-                f"La base active n'est pas {AIVEN_MYSQL_DATABASE!r}."
-            )
-
-        return result
-
-    def ensure_table(self):
-        connection = self.ensure_connection()
+    def ensure_table(
+        self,
+    ):
+        connection = (
+            self.ensure_connection()
+        )
 
         sql = f"""
         CREATE TABLE IF NOT EXISTS `{AIVEN_MYSQL_TABLE}` (
             `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-
             `nom` VARCHAR(255) NULL,
             `code_isin` VARCHAR(64) NULL,
             `seuil_bas` DECIMAL(30,10) NULL,
             `mnemonique` VARCHAR(64) NOT NULL,
             `seuil_haut` DECIMAL(30,10) NULL,
             `valeur_cmp` DECIMAL(30,10) NULL,
-
             `cours_veille` DECIMAL(30,10) NULL,
             `carnet_ordres` JSON NULL,
             `dernier_cours` DECIMAL(30,10) NULL,
             `groupe_marche` VARCHAR(64) NULL,
-
             `cours_max_jour` DECIMAL(30,10) NULL,
             `cours_min_jour` DECIMAL(30,10) NULL,
             `cours_ouverture` DECIMAL(30,10) NULL,
-
             `valeur_echangee` DECIMAL(36,10) NULL,
             `quantite_echangee` BIGINT NULL,
-
             `statut_suspension` VARCHAR(255) NULL,
-
             `variation_montant` DECIMAL(30,10) NULL,
             `info_dernier_echange` VARCHAR(255) NULL,
             `variation_pourcentage` DECIMAL(30,10) NULL,
-
             `heure_derniere_execution` VARCHAR(64) NULL,
-
             `prix_theorique_ouverture` DECIMAL(30,10) NULL,
             `quantite_dernier_echange` BIGINT NULL,
             `quantite_theorique_ouverture` BIGINT NULL,
-
             `horodatage_derniere_execution` VARCHAR(128) NULL,
             `variation_theorique_ouverture` DECIMAL(30,10) NULL,
-
             `collected_at` DATETIME(6) NOT NULL,
 
             PRIMARY KEY (`id`),
@@ -668,10 +738,7 @@ class AivenMySQLClient:
                 (`code_isin`),
 
             INDEX `idx_brvm_collected_at`
-                (`collected_at`),
-
-            INDEX `idx_brvm_mnemonique_date`
-                (`mnemonique`, `collected_at`)
+                (`collected_at`)
         )
         ENGINE=InnoDB
         DEFAULT CHARSET=utf8mb4
@@ -680,7 +747,9 @@ class AivenMySQLClient:
 
         try:
             with connection.cursor() as cursor:
-                cursor.execute(sql)
+                cursor.execute(
+                    sql
+                )
 
                 cursor.execute(
                     f"""
@@ -695,161 +764,111 @@ class AivenMySQLClient:
             connection.rollback()
             raise
 
-        self._verifier_schema()
-
         logger.info(
-            "Table prête : %s.%s | AUTO_INCREMENT >= %s",
+            "Table prête : %s.%s",
             AIVEN_MYSQL_DATABASE,
             AIVEN_MYSQL_TABLE,
-            AIVEN_FIRST_ID,
         )
 
-    def _verifier_schema(self):
-        colonnes_attendues = {
-            "id",
-            "nom",
-            "code_isin",
-            "seuil_bas",
-            "mnemonique",
-            "seuil_haut",
-            "valeur_cmp",
-            "cours_veille",
-            "carnet_ordres",
-            "dernier_cours",
-            "groupe_marche",
-            "cours_max_jour",
-            "cours_min_jour",
-            "cours_ouverture",
-            "valeur_echangee",
-            "quantite_echangee",
-            "statut_suspension",
-            "variation_montant",
-            "info_dernier_echange",
-            "variation_pourcentage",
-            "heure_derniere_execution",
-            "prix_theorique_ouverture",
-            "quantite_dernier_echange",
-            "quantite_theorique_ouverture",
-            "horodatage_derniere_execution",
-            "variation_theorique_ouverture",
-            "collected_at",
-        }
-
-        connection = self.ensure_connection()
+    def get_database_size_mb(
+        self,
+    ):
+        connection = (
+            self.ensure_connection()
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
-                f"""
-                SHOW COLUMNS
-                FROM `{AIVEN_MYSQL_TABLE}`
                 """
-            )
-
-            result = cursor.fetchall()
-
-        colonnes_actuelles = {
-            row["Field"]
-            for row in result
-        }
-
-        manquantes = (
-            colonnes_attendues
-            - colonnes_actuelles
-        )
-
-        if manquantes:
-            raise RuntimeError(
-                "Schéma de table incompatible. "
-                "Colonnes manquantes : "
-                + ", ".join(
-                    sorted(manquantes)
-                )
-            )
-
-    def get_database_size_mb(self):
-        connection = self.ensure_connection()
-
-        sql = """
-        SELECT
-            COALESCE(
-                SUM(data_length + index_length),
-                0
-            ) / 1024 / 1024 AS size_mb
-        FROM information_schema.tables
-        WHERE table_schema = %s
-        """
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                sql,
-                (AIVEN_MYSQL_DATABASE,),
+                SELECT
+                    COALESCE(
+                        SUM(data_length + index_length),
+                        0
+                    ) / 1024 / 1024 AS size_mb
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                """,
+                (
+                    AIVEN_MYSQL_DATABASE,
+                ),
             )
 
             result = cursor.fetchone()
 
         return float(
-            result.get("size_mb") or 0.0
+            result.get(
+                "size_mb"
+            )
+            or 0.0
         )
 
     def check_storage_limit(
         self,
         force=False,
     ):
-        now = time_module.time()
+        maintenant = (
+            time_module.time()
+        )
 
         if (
             not force
-            and (
-                now
-                - self.last_storage_check
-                < STORAGE_CHECK_INTERVAL_SECONDS
-            )
+            and maintenant
+            - self.last_storage_check
+            < STORAGE_CHECK_INTERVAL_SECONDS
         ):
-            return True
+            return
 
-        size_mb = self.get_database_size_mb()
+        taille = (
+            self.get_database_size_mb()
+        )
 
-        self.last_storage_check = now
-        self.last_storage_size_mb = size_mb
-
-        percentage = (
-            size_mb
-            / AIVEN_MAX_STORAGE_MB
-            * 100
+        self.last_storage_check = (
+            maintenant
         )
 
         logger.info(
-            "Stockage logique defaultdb : %.2f Mo / %.2f Mo "
-            "(%.1f%% du seuil configuré)",
-            size_mb,
+            "Stockage defaultdb : %.2f Mo / %.2f Mo",
+            taille,
             AIVEN_MAX_STORAGE_MB,
-            percentage,
         )
 
         if (
-            size_mb
+            taille
             >= AIVEN_MAX_STORAGE_MB
         ):
             raise StorageLimitReached(
-                "Seuil de stockage Aiven atteint : "
-                f"{size_mb:.2f} Mo / "
-                f"{AIVEN_MAX_STORAGE_MB:.2f} Mo"
+                f"Seuil Aiven atteint : "
+                f"{taille:.2f} Mo"
             )
-
-        return True
 
     def insert_market_snapshot(
         self,
         donnees_marche,
     ):
-        if not donnees_marche:
-            return 0
+        """
+        Fidèle à la logique locale :
+        chaque réponse MarketDetails valide déclenche l'insertion
+        du snapshot courant complet.
+
+        On ne fait PAS de déduplication entre deux réponses,
+        parce que le scraper local appelle Collecte_data_BRVM()
+        à chaque réponse MarketDetails.
+        """
 
         self.check_storage_limit()
 
-        connection = self.ensure_connection()
+        connection = (
+            self.ensure_connection()
+        )
 
-        collected_at = datetime.now()
+        collected_at = (
+            datetime.now(
+                COLLECT_TIMEZONE
+            )
+            .replace(
+                tzinfo=None
+            )
+        )
 
         sql = f"""
         INSERT INTO `{AIVEN_MYSQL_TABLE}`
@@ -894,9 +913,16 @@ class AivenMySQLClient:
         lignes = []
 
         for (
-            cle_instrument,
+            cle,
             data,
         ) in donnees_marche.items():
+
+            if str(
+                cle
+            ).startswith(
+                "_"
+            ):
+                continue
 
             if not isinstance(
                 data,
@@ -904,12 +930,14 @@ class AivenMySQLClient:
             ):
                 continue
 
-            mnemonique = convertir_texte(
-                data.get(
-                    "mnemonique",
-                    cle_instrument,
-                ),
-                64,
+            mnemonique = (
+                convertir_texte(
+                    data.get(
+                        "mnemonique",
+                        cle,
+                    ),
+                    64,
+                )
             )
 
             if not mnemonique:
@@ -967,56 +995,38 @@ class AivenMySQLClient:
                         data.get("quantite_echangee")
                     ),
                     convertir_texte(
-                        data.get(
-                            "statut_suspension"
-                        ),
+                        data.get("statut_suspension"),
                         255,
                     ),
                     convertir_decimal(
                         data.get("variation_montant")
                     ),
                     convertir_texte(
-                        data.get(
-                            "info_dernier_echange"
-                        ),
+                        data.get("info_dernier_echange"),
                         255,
                     ),
                     convertir_decimal(
-                        data.get(
-                            "variation_pourcentage"
-                        )
+                        data.get("variation_pourcentage")
                     ),
                     convertir_texte(
-                        data.get(
-                            "heure_derniere_execution"
-                        ),
+                        data.get("heure_derniere_execution"),
                         64,
                     ),
                     convertir_decimal(
-                        data.get(
-                            "prix_theorique_ouverture"
-                        )
+                        data.get("prix_theorique_ouverture")
                     ),
                     convertir_entier(
-                        data.get(
-                            "quantite_dernier_echange"
-                        )
+                        data.get("quantite_dernier_echange")
                     ),
                     convertir_entier(
-                        data.get(
-                            "quantite_theorique_ouverture"
-                        )
+                        data.get("quantite_theorique_ouverture")
                     ),
                     convertir_texte(
-                        data.get(
-                            "horodatage_derniere_execution"
-                        ),
+                        data.get("horodatage_derniere_execution"),
                         128,
                     ),
                     convertir_decimal(
-                        data.get(
-                            "variation_theorique_ouverture"
-                        )
+                        data.get("variation_theorique_ouverture")
                     ),
                     collected_at,
                 )
@@ -1034,46 +1044,41 @@ class AivenMySQLClient:
 
             connection.commit()
 
-            logger.info(
-                "%s ligne(s) enregistrée(s) dans %s.%s.",
-                len(lignes),
-                AIVEN_MYSQL_DATABASE,
-                AIVEN_MYSQL_TABLE,
-            )
-
-            return len(lignes)
-
-        except pymysql.MySQLError as exc:
+        except Exception:
             connection.rollback()
-
-            message = str(exc).lower()
-
-            if any(
-                mot in message
-                for mot in (
-                    "disk full",
-                    "no space",
-                    "out of space",
-                    "quota",
-                    "table is full",
-                )
-            ):
-                raise StorageLimitReached(
-                    f"Aiven/MySQL signale un stockage plein : {exc}"
-                ) from exc
-
             raise
 
-    def close(self):
-        if (
-            self.connection is not None
-        ):
+        runtime_state[
+            "rows_inserted"
+        ] += len(
+            lignes
+        )
+
+        runtime_state[
+            "last_insert_at"
+        ] = datetime.now(
+            COLLECT_TIMEZONE
+        ).isoformat()
+
+        logger.info(
+            "%s ligne(s) enregistrée(s) dans Aiven.",
+            len(
+                lignes
+            ),
+        )
+
+        return len(
+            lignes
+        )
+
+    def close(
+        self,
+    ):
+        if self.connection is not None:
             try:
                 self.connection.close()
-
             except Exception:
                 pass
-
             finally:
                 self.connection = None
 
@@ -1082,57 +1087,44 @@ db = AivenMySQLClient()
 
 
 # ============================================================
-# 11. DONNÉES EN MÉMOIRE
+# 14. CACHES IDENTIQUES AU LOCAL
 # ============================================================
 
 donnees_marche_cache_actuel = {}
-
 historique_profondeur_marche = {}
 historique_variation_marche = {}
 historique_transactions = {}
 
-historical_data = deque(maxlen=MAX_RAW_RESPONSES_IN_MEMORY)
+historical_data = deque(
+    maxlen=MAX_RAW_RESPONSES_IN_MEMORY
+)
 
 
 # ============================================================
-# 12. CALENDRIER DE COLLECTE + SERVEUR HTTP RENDER
+# 15. HORAIRES
 # ============================================================
 
 def maintenant_marche():
-    """
-    Heure courante dans le fuseau choisi pour la collecte.
-    """
     return datetime.now(
         COLLECT_TIMEZONE
     )
 
 
-def est_jour_ouvre(moment=None):
-    """
-    Lundi=0 ... vendredi=4.
-    Samedi et dimanche sont toujours exclus.
-    """
+def est_dans_fenetre_collecte(
+    moment=None,
+):
     if moment is None:
         moment = maintenant_marche()
 
-    return moment.weekday() < 5
-
-
-def est_dans_fenetre_collecte(moment=None):
-    """
-    True uniquement :
-      - du lundi au vendredi ;
-      - entre 10h00 et 16h30 incluses
-        (ou les valeurs définies dans .env).
-    """
-    if moment is None:
-        moment = maintenant_marche()
-
-    if not est_jour_ouvre(moment):
+    # lundi=0 ... vendredi=4
+    if moment.weekday() >= 5:
         return False
 
-    heure = moment.time().replace(
-        tzinfo=None
+    heure = (
+        moment.time()
+        .replace(
+            tzinfo=None
+        )
     )
 
     return (
@@ -1142,18 +1134,23 @@ def est_dans_fenetre_collecte(moment=None):
     )
 
 
-def prochaine_ouverture(moment=None):
-    """
-    Calcule la prochaine ouverture du créneau de collecte.
-    """
+def prochaine_ouverture(
+    moment=None,
+):
     if moment is None:
         moment = maintenant_marche()
 
-    # Si nous sommes avant l'ouverture d'un jour ouvré,
-    # l'ouverture est aujourd'hui.
+    heure = (
+        moment.time()
+        .replace(
+            tzinfo=None
+        )
+    )
+
     if (
-        est_jour_ouvre(moment)
-        and moment.time().replace(tzinfo=None)
+        moment.weekday()
+        < 5
+        and heure
         < COLLECT_START_TIME
     ):
         return datetime.combine(
@@ -1162,137 +1159,112 @@ def prochaine_ouverture(moment=None):
             tzinfo=COLLECT_TIMEZONE,
         )
 
-    # Sinon, recherche le prochain jour ouvré.
-    for decalage in range(1, 8):
-        prochaine_date = (
+    for jours in range(
+        1,
+        8,
+    ):
+        date_cible = (
             moment.date()
-            + timedelta(days=decalage)
+            + timedelta(
+                days=jours
+            )
         )
 
-        if prochaine_date.weekday() < 5:
+        if (
+            date_cible.weekday()
+            < 5
+        ):
             return datetime.combine(
-                prochaine_date,
+                date_cible,
                 COLLECT_START_TIME,
                 tzinfo=COLLECT_TIMEZONE,
             )
 
     raise RuntimeError(
-        "Impossible de calculer la prochaine ouverture."
+        "Prochaine ouverture introuvable."
     )
 
 
-def attendre_fenetre_collecte():
-    """
-    Hors marché, ne lance pas Selenium.
-    Le processus reste disponible pour le serveur HTTP Render.
-    """
-    while True:
-        moment = maintenant_marche()
+def attendre_ouverture():
+    while not est_dans_fenetre_collecte():
 
-        if est_dans_fenetre_collecte(
-            moment
-        ):
-            logger.info(
-                "Fenêtre de collecte ouverte | %s",
-                moment.isoformat(),
-            )
-            return
-
-        prochaine = prochaine_ouverture(
-            moment
+        maintenant = (
+            maintenant_marche()
         )
 
-        secondes = max(
-            1,
-            int(
-                (
-                    prochaine
-                    - moment
-                ).total_seconds()
-            ),
+        prochaine = (
+            prochaine_ouverture(
+                maintenant
+            )
         )
 
         logger.info(
-            "Collecte inactive | maintenant=%s | "
-            "prochaine ouverture=%s",
-            moment.strftime(
-                "%Y-%m-%d %H:%M:%S %Z"
-            ),
+            "Hors séance | prochaine collecte : %s",
             prochaine.strftime(
                 "%Y-%m-%d %H:%M:%S %Z"
             ),
         )
 
         time_module.sleep(
-            min(
-                OUTSIDE_WINDOW_CHECK_SECONDS,
-                secondes,
-            )
+            OUTSIDE_WINDOW_CHECK_SECONDS
         )
 
 
-class RenderHealthHandler(
+# ============================================================
+# 16. HEALTH RENDER
+# ============================================================
+
+class HealthHandler(
     BaseHTTPRequestHandler
 ):
-    """
-    Petit endpoint HTTP pour Render :
-      GET /
-      GET /health
-    """
-
-    def do_GET(self):
-        moment = maintenant_marche()
-
+    def do_GET(
+        self,
+    ):
         payload = {
             "status": "ok",
-            "service": "brvm-collector",
-            "timezone": COLLECT_TIMEZONE_NAME,
-            "local_time": moment.isoformat(),
-            "weekday": moment.strftime("%A"),
-            "collection_window_open": (
-                est_dans_fenetre_collecte(
-                    moment
-                )
-            ),
-            "collection_schedule": (
-                f"Monday-Friday "
-                f"{COLLECT_START_TIME.strftime('%H:%M')}"
-                f"-{COLLECT_END_TIME.strftime('%H:%M')}"
-            ),
-            "database": AIVEN_MYSQL_DATABASE,
-            "table": AIVEN_MYSQL_TABLE,
+            "service": "brvm-render-aiven",
+            "time": maintenant_marche().isoformat(),
+            "collection_window_open": est_dans_fenetre_collecte(),
+            **runtime_state,
         }
 
         body = json.dumps(
             payload,
             ensure_ascii=False,
-        ).encode("utf-8")
+        ).encode(
+            "utf-8"
+        )
 
-        self.send_response(200)
+        self.send_response(
+            200
+        )
+
         self.send_header(
             "Content-Type",
-            "application/json; charset=utf-8",
+            "application/json",
         )
+
         self.send_header(
             "Content-Length",
-            str(len(body)),
+            str(
+                len(body)
+            ),
         )
+
         self.end_headers()
-        self.wfile.write(body)
+
+        self.wfile.write(
+            body
+        )
 
     def log_message(
         self,
-        format,
         *args,
     ):
-        # Évite de polluer collecte_brvm.log à chaque health check.
         return
 
 
-def demarrer_serveur_render():
-    """
-    Un Web Service Render doit écouter le port fourni par $PORT.
-    """
+def demarrer_health_server():
     port = int(
         os.getenv(
             "PORT",
@@ -1301,29 +1273,28 @@ def demarrer_serveur_render():
     )
 
     server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        RenderHealthHandler,
+        (
+            "0.0.0.0",
+            port,
+        ),
+        HealthHandler,
     )
 
     thread = threading.Thread(
         target=server.serve_forever,
-        name="render-health-server",
         daemon=True,
     )
 
     thread.start()
 
     logger.info(
-        "Serveur HTTP Render actif sur 0.0.0.0:%s "
-        "(/ et /health)",
+        "Health Render actif sur port %s.",
         port,
     )
 
-    return server
-
 
 # ============================================================
-# 13. SELENIUM
+# 17. CHROME
 # ============================================================
 
 def creer_driver():
@@ -1334,8 +1305,12 @@ def creer_driver():
             "--headless=new"
         )
 
+    options.binary_location = (
+        CHROME_BIN
+    )
+
     options.add_argument(
-        "--disable-blink-features=AutomationControlled"
+        "--no-sandbox"
     )
 
     options.add_argument(
@@ -1343,7 +1318,7 @@ def creer_driver():
     )
 
     options.add_argument(
-        "--no-sandbox"
+        "--disable-blink-features=AutomationControlled"
     )
 
     options.add_argument(
@@ -1360,6 +1335,7 @@ def creer_driver():
         False,
     )
 
+    # EXACTEMENT le mécanisme utilisé en local.
     options.set_capability(
         "goog:loggingPrefs",
         {
@@ -1367,55 +1343,81 @@ def creer_driver():
         },
     )
 
-    driver_instance = webdriver.Chrome(
-        options=options
+    service = Service(
+        executable_path=CHROMEDRIVER_PATH
     )
 
-    # Active explicitement le domaine Network CDP.
-    driver_instance.execute_cdp_cmd(
+    driver = webdriver.Chrome(
+        service=service,
+        options=options,
+    )
+
+    driver.set_page_load_timeout(
+        30
+    )
+
+    driver.set_script_timeout(
+        30
+    )
+
+    driver.execute_cdp_cmd(
         "Network.enable",
         {}
     )
 
-    driver_instance.set_page_load_timeout(
-        25
-    )
-
-    driver_instance.implicitly_wait(
-        2
-    )
-
-    return driver_instance
+    return driver
 
 
-def start(
-    driver_instance,
+# ============================================================
+# 18. CONNEXION SGI
+# ============================================================
+
+XPATH_CONNECTE = (
+    "/html/body/div[1]/div/div[3]"
+    "/table/tbody/tr/td[2]/div"
+)
+
+XPATH_LOGIN = (
+    "/html/body/div[1]/div[2]"
+    "/div[2]/input[1]"
+)
+
+XPATH_PASSWORD = (
+    "/html/body/div[1]/div[2]"
+    "/div[2]/input[2]"
+)
+
+XPATH_CONNECT_BUTTON = (
+    "/html/body/div[1]/div[2]"
+    "/div[2]/input[3]"
+)
+
+
+def start_sgi(
+    driver,
 ):
     logger.info(
-        "Ouverture SGI : %s",
-        SGI_BASE_URL,
+        "Ouverture SGI."
     )
 
-    driver_instance.get(
+    driver.get(
         SGI_BASE_URL
     )
 
+
 def est_connecte(
-    driver_instance,
+    driver,
     timeout=5,
 ):
     try:
         WebDriverWait(
-            driver_instance,
+            driver,
             timeout,
         ).until(
             EC.presence_of_element_located(
                 (
                     By.XPATH,
-                    (
-                        "/html/body/div[1]/div/div[3]"
-                        "/table/tbody/tr/td[2]/div"
-                    ),
+                    XPATH_CONNECTE,
                 )
             )
         )
@@ -1425,383 +1427,192 @@ def est_connecte(
     except TimeoutException:
         return False
 
+
 def signin(
-    driver_instance,
+    driver,
 ):
     logger.info(
-        "Tentative de connexion au compte SGI."
+        "Authentification SGI."
     )
 
     wait = WebDriverWait(
-        driver_instance,
+        driver,
         30,
     )
 
-    login_input = wait.until(
+    login = wait.until(
         EC.visibility_of_element_located(
             (
                 By.XPATH,
-                (
-                    "/html/body/div[1]/div[2]"
-                    "/div[2]/input[1]"
-                ),
+                XPATH_LOGIN,
             )
         )
     )
 
-    password_input = wait.until(
+    password = wait.until(
         EC.visibility_of_element_located(
             (
                 By.XPATH,
-                (
-                    "/html/body/div[1]/div[2]"
-                    "/div[2]/input[2]"
-                ),
+                XPATH_PASSWORD,
             )
         )
     )
 
-    connect_button = wait.until(
+    bouton = wait.until(
         EC.element_to_be_clickable(
             (
                 By.XPATH,
-                (
-                    "/html/body/div[1]/div[2]"
-                    "/div[2]/input[3]"
-                ),
+                XPATH_CONNECT_BUTTON,
             )
         )
     )
 
-    login_input.clear()
-    login_input.send_keys(
+    login.clear()
+    login.send_keys(
         SGI_LOGIN
     )
 
-    password_input.clear()
-    password_input.send_keys(
+    password.clear()
+    password.send_keys(
         SGI_PASSWORD
     )
 
-    logger.info(
-        "Formulaire SGI rempli."
-    )
+    bouton.click()
 
-    connect_button.click()
-
-    logger.info(
-        "Bouton de connexion SGI cliqué."
-    )
-
-def assurer_connexion_sgi(
-    driver_instance,
-):
-    # La session est peut-être déjà ouverte.
-    if est_connecte(
-        driver_instance,
-        timeout=5,
-    ):
-        logger.info(
-            "Session SGI déjà connectée."
-        )
-        return True
-
-    logger.info(
-        "Session SGI non connectée. "
-        "Tentative d'authentification."
-    )
-
-    signin(
-        driver_instance
-    )
-
-    # On laisse maintenant jusqu'à 30 secondes au site
-    # pour terminer l'authentification.
-    if est_connecte(
-        driver_instance,
+    if not est_connecte(
+        driver,
         timeout=30,
     ):
-        logger.info(
-            "Connexion SGI confirmée."
-        )
-        return True
-
-    # ========================================================
-    # DIAGNOSTIC
-    # ========================================================
-
-    try:
-        logger.error(
-            "Échec connexion SGI | URL actuelle : %s",
-            driver_instance.current_url,
+        raise RuntimeError(
+            "Connexion SGI non confirmée."
         )
 
-        logger.error(
-            "Échec connexion SGI | Titre page : %s",
-            driver_instance.title,
-        )
-
-        body_text = driver_instance.find_element(
-            By.TAG_NAME,
-            "body",
-        ).text
-
-        # Seulement les 2000 premiers caractères.
-        # On évite de remplir les logs Render.
-        logger.error(
-            "Contenu visible de la page SGI : %s",
-            body_text[:2000],
-        )
-
-    except Exception as diagnostic_error:
-        logger.warning(
-            "Impossible de récupérer le diagnostic SGI : %s",
-            diagnostic_error,
-        )
-
-    raise RuntimeError(
-        "Impossible de confirmer la connexion SGI "
-        "après 30 secondes."
+    logger.info(
+        "Connexion SGI confirmée."
     )
+
+
+def assurer_connexion_sgi(
+    driver,
+):
+    if est_connecte(
+        driver,
+        timeout=3,
+    ):
+        return
+
+    signin(
+        driver
+    )
+
+
+# ============================================================
+# 19. GET RESPONSE BODY — LOGIQUE LOCALE + RETRIES RENDER
+# ============================================================
+
+def get_response_body_once(
+    driver,
+    request_id,
+):
+    response = (
+        driver.execute_cdp_cmd(
+            "Network.getResponseBody",
+            {
+                "requestId": request_id,
+            },
+        )
+    )
+
+    body = response.get(
+        "body"
+    )
+
+    if (
+        body
+        and response.get(
+            "base64Encoded"
+        )
+    ):
+        body = (
+            base64.b64decode(
+                body
+            )
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+    return body
 
 
 def get_response_body(
-    driver_instance,
+    driver,
     request_id,
 ):
     """
-    Récupère le body d'une réponse réseau APRÈS Network.loadingFinished.
+    Le local appelle getResponseBody immédiatement.
+    On fait pareil.
 
-    Chrome peut parfois renvoyer le body encodé en base64.
-    """
-    try:
-        response = (
-            driver_instance
-            .execute_cdp_cmd(
-                "Network.getResponseBody",
-                {
-                    "requestId": request_id,
-                },
-            )
-        )
-
-        body = response.get(
-            "body"
-        )
-
-        if not body:
-            return None
-
-        if response.get(
-            "base64Encoded"
-        ):
-            try:
-                body = base64.b64decode(
-                    body
-                ).decode(
-                    "utf-8",
-                    errors="replace",
-                )
-
-            except Exception as exc:
-                logger.warning(
-                    "Impossible de décoder le body base64 "
-                    "requestId=%s : %s",
-                    request_id,
-                    exc,
-                )
-
-        return body
-
-    except Exception as exc:
-        logger.warning(
-            "Body indisponible après loadingFinished "
-            "requestId=%s : %s",
-            request_id,
-            exc,
-        )
-
-        return None
-
-
-# ============================================================
-# 14. ALERTES PORTEFEUILLE
-# ============================================================
-
-def _normaliser_float(value):
-    result = convertir_decimal(
-        value
-    )
-
-    if result is None:
-        return None
-
-    return float(result)
-
-
-def _normaliser_entier(value):
-    result = convertir_entier(
-        value
-    )
-
-    if result is None:
-        return 0
-
-    return result
-
-
-def signale(
-    driver_instance,
-):
-    """
-    Contrôle du portefeuille.
-    En mode 24h/headless, on écrit les alertes dans les logs.
-    Aucun popup Tkinter n'est utilisé.
+    La seule différence est un retry court pour absorber
+    la latence Render/Chromium.
     """
 
-    logger.info(
-        "Contrôle du portefeuille SGI."
-    )
+    derniere_erreur = None
 
-    link_portefeuille = (
-        driver_instance.find_element(
-            By.XPATH,
-            (
-                "/html/body/div[1]/div/div[3]"
-                "/table/tbody/tr/td[2]/div/button"
-            ),
-        )
-    )
-
-    link_portefeuille.click()
-
-    time_module.sleep(
-        1
-    )
-
-    n = 18
-
-    actifs_rendements = []
-    actifs_nbr = []
-    actifs_name = []
-
-    for m in range(2, n):
-        xpath = (
-            "/html/body/div[7]/div[2]/div/div[2]"
-            "/div[2]/div[2]/div/div/table/tbody"
-            f"/tr[{m}]/td[11]"
-        )
-
-        actifs_rendements.append(
-            driver_instance.find_element(
-                By.XPATH,
-                xpath,
-            ).text
-        )
-
-    for m in range(2, n):
-        xpath = (
-            "/html/body/div[7]/div[2]/div/div[2]"
-            "/div[2]/div[2]/div/div/table/tbody"
-            f"/tr[{m}]/td[7]"
-        )
-
-        actifs_nbr.append(
-            driver_instance.find_element(
-                By.XPATH,
-                xpath,
-            ).text
-        )
-
-    for m in range(2, n):
-        xpath = (
-            "/html/body/div[7]/div[2]/div/div[2]"
-            "/div[2]/div[2]/div/div/table/tbody"
-            f"/tr[{m}]/td[2]"
-        )
-
-        actifs_name.append(
-            driver_instance.find_element(
-                By.XPATH,
-                xpath,
-            ).text
-        )
-
-    limite_rouge = -10
-    limite_orange = -7
-    limite_jaune = 10
-    limite_verte = 13
-
-    for (
-        index,
-        rendement_brut,
-    ) in enumerate(
-        actifs_rendements
+    for tentative in range(
+        RESPONSE_BODY_RETRIES
     ):
-        rendement = _normaliser_float(
-            rendement_brut
-        )
+        try:
+            body = get_response_body_once(
+                driver,
+                request_id,
+            )
 
-        quantite = _normaliser_entier(
-            actifs_nbr[index]
-        )
+            if body:
+                return body
 
-        if rendement is None:
-            continue
+        except Exception as exc:
+            derniere_erreur = exc
 
         if (
-            rendement <= limite_rouge
-            and quantite > 1
+            tentative
+            < RESPONSE_BODY_RETRIES
+            - 1
         ):
-            logger.warning(
-                "ZONE ROUGE | %s | rendement=%s",
-                actifs_name[index],
-                rendement,
+            time_module.sleep(
+                RESPONSE_BODY_RETRY_DELAY
             )
 
-        elif (
-            rendement <= limite_orange
-            and quantite > 2
-        ):
-            logger.warning(
-                "ZONE ORANGE | %s | rendement=%s",
-                actifs_name[index],
-                rendement,
-            )
+    if derniere_erreur:
+        logger.debug(
+            "Body MarketDetails pas encore disponible "
+            "| requestId=%s | erreur=%s",
+            request_id,
+            derniere_erreur,
+        )
 
-        elif (
-            rendement >= limite_verte
-            and quantite > 3
-        ):
-            logger.info(
-                "ZONE VERTE | %s | rendement=%s",
-                actifs_name[index],
-                rendement,
-            )
-
-        elif (
-            rendement >= limite_jaune
-            and quantite > 2
-        ):
-            logger.info(
-                "ZONE JAUNE | %s | rendement=%s",
-                actifs_name[index],
-                rendement,
-            )
+    return None
 
 
 # ============================================================
-# 15. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
+# 20. LIMITATION DES HISTORIQUES EN RAM
 # ============================================================
 
-def limiter_historique_par_instrument(historique):
-    """
-    Les fonctions de parsing peuvent accumuler des horodatages sans limite.
-    On conserve seulement les N entrées les plus récentes par instrument.
-    """
+def limiter_historique(
+    historique,
+):
+    for (
+        mnemonique,
+        sous_historique,
+    ) in list(
+        historique.items()
+    ):
 
-    for mnemonique, sous_historique in list(historique.items()):
-        if not isinstance(sous_historique, dict):
+        if not isinstance(
+            sous_historique,
+            dict,
+        ):
             continue
 
         depassement = (
@@ -1812,10 +1623,11 @@ def limiter_historique_par_instrument(historique):
         if depassement <= 0:
             continue
 
-        # Les dictionnaires Python conservent l'ordre d'insertion.
         anciennes_cles = list(
             sous_historique.keys()
-        )[:depassement]
+        )[
+            :depassement
+        ]
 
         for cle in anciennes_cles:
             sous_historique.pop(
@@ -1824,40 +1636,51 @@ def limiter_historique_par_instrument(historique):
             )
 
 
-def nettoyer_historiques_memoire():
-    limiter_historique_par_instrument(
+def nettoyer_historiques_ram():
+    limiter_historique(
         historique_profondeur_marche
     )
 
-    limiter_historique_par_instrument(
+    limiter_historique(
         historique_variation_marche
     )
 
-    limiter_historique_par_instrument(
+    limiter_historique(
         historique_transactions
     )
 
 
 # ============================================================
-# 16. TRAITEMENT DES RÉPONSES MARCHÉ
+# 21. TRAITEMENT D'UNE REPONSE
 # ============================================================
 
-def traiter_reponse_marche(
+def traiter_marketdetails_body(
     response_body,
-    dernier_snapshot,
 ):
-    global historical_data
+    """
+    Reproduit la séquence locale :
+
+        historical_data.append(...)
+        traiter_bloc_xml(...)
+        Collecte_data_BRVM(...)
+
+    Sauf que Collecte_data_BRVM() est remplacée par
+    l'insertion directe Aiven.
+    """
+
+    if not response_body:
+        return
 
     historical_data.append(
         [
-            time_module.strftime(
+            maintenant_marche().strftime(
                 "%H:%M:%S"
             ),
             response_body,
         ]
     )
 
-    traiter_bloc_xml(
+    resultat = traiter_bloc_xml(
         response_body,
         donnees_marche_cache_actuel,
         historique_profondeur_marche,
@@ -1865,570 +1688,502 @@ def traiter_reponse_marche(
         historique_transactions,
     )
 
-    nettoyer_historiques_memoire()
+    if not resultat:
+        logger.warning(
+            "Bloc MarketDetails reçu mais XML non traité."
+        )
+        return
 
-    snapshot_actuel = copy.deepcopy(
+    nettoyer_historiques_ram()
+
+    runtime_state[
+        "market_bodies_processed"
+    ] += 1
+
+    # IDENTIQUE au comportement effectif du local :
+    # insertion à chaque body MarketDetails correctement parsé.
+    db.insert_market_snapshot(
         donnees_marche_cache_actuel
     )
 
-    if not snapshot_actuel:
-        return dernier_snapshot
-
-    if (
-        dernier_snapshot is not None
-        and snapshot_actuel == dernier_snapshot
-    ):
-        return dernier_snapshot
-
-    db.insert_market_snapshot(
-        snapshot_actuel
-    )
-
-    return snapshot_actuel
-
 
 # ============================================================
-# 17. BOUCLE DE COLLECTE
+# 22. COLLECTE — CALQUEE SUR brvmscraping1.py
 # ============================================================
 
 def collecte(
-    driver_instance,
+    driver,
 ):
     """
-    Collecte événementielle native du site SGI.
+    Le coeur de cette fonction suit volontairement
+    brvmscraping1.py.
 
-    À chaque modification de marché, le site envoie lui-même
-    un nouveau POST MarketDetails.aspx.
-
-    Cycle suivi :
-        Network.requestWillBeSent
-            -> mémoriser requestId
-        Network.responseReceived
-            -> mémoriser le statut HTTP
-        Network.loadingFinished
-            -> Network.getResponseBody(requestId)
-            -> traiter_bloc_xml()
-            -> comparaison du snapshot
-            -> INSERT Aiven uniquement si changement réel
-
-    Aucun polling artificiel de MarketDetails.aspx n'est utilisé.
+    On lit driver.get_log("performance") en boucle et on traite
+    chaque Network.responseReceived de MarketDetails.aspx.
     """
 
-    heure_onze = time(11, 0, 0)
-    heure_onze_fin = time(11, 1, 5)
-
-    heure_quatorze = time(14, 0, 0)
-    heure_quatorze_fin = time(14, 1, 5)
-
-    heure_seize = time(16, 0, 0)
-    heure_seize_fin = time(16, 1, 5)
-
-    dernier_snapshot = None
-    alertes_executees = set()
-    dernier_check_session = 0.0
-
-    # requestId -> informations de la requête MarketDetails
-    market_requests_en_cours = {}
-
-    compteur_marketdetails = 0
-
     logger.info(
-        "Boucle de collecte événementielle démarrée."
+        "Collecte réseau SGI démarrée."
     )
 
-    while True:
+    dernier_check_session = 0.0
 
-        # ----------------------------------------------------
-        # FIN IMMÉDIATE DE LA SESSION HORS CRÉNEAU
-        # ----------------------------------------------------
+    # Fallback :
+    # si responseReceived arrive un peu avant que le body soit
+    # disponible sur Render, on réessaye lorsque loadingFinished
+    # apparaît.
+    pending_marketdetails = {}
 
-        moment_marche = maintenant_marche()
+    # Pour éviter un double traitement :
+    processed_ids = set()
+    processed_order = deque(
+        maxlen=1000
+    )
 
-        if not est_dans_fenetre_collecte(
-            moment_marche
-        ):
-            logger.info(
-                "Fermeture de la session Selenium : "
-                "fin du créneau de collecte (%s).",
-                moment_marche.strftime(
-                    "%Y-%m-%d %H:%M:%S %Z"
-                ),
-            )
+    def marquer_traite(
+        request_id,
+    ):
+        if request_id in processed_ids:
             return
 
-        # ----------------------------------------------------
-        # VÉRIFICATION DE LA SESSION SGI
-        # ----------------------------------------------------
+        if (
+            len(processed_order)
+            == processed_order.maxlen
+        ):
+            ancien = processed_order[
+                0
+            ]
 
-        now_epoch = time_module.time()
+            processed_ids.discard(
+                ancien
+            )
+
+        processed_order.append(
+            request_id
+        )
+
+        processed_ids.add(
+            request_id
+        )
+
+    while est_dans_fenetre_collecte():
+
+        maintenant_epoch = (
+            time_module.time()
+        )
+
+        # -----------------------------------------------
+        # Session SGI
+        # -----------------------------------------------
 
         if (
-            now_epoch
+            maintenant_epoch
             - dernier_check_session
-            >= 60
+            >= SESSION_CHECK_SECONDS
         ):
             assurer_connexion_sgi(
-                driver_instance
+                driver
             )
 
             dernier_check_session = (
-                now_epoch
+                maintenant_epoch
             )
 
-        # ----------------------------------------------------
-        # CONTRÔLE DU STOCKAGE
-        # ----------------------------------------------------
+        # -----------------------------------------------
+        # Stockage Aiven
+        # -----------------------------------------------
 
         db.check_storage_limit()
 
-        # ----------------------------------------------------
-        # CONTRÔLES PORTEFEUILLE
-        # ----------------------------------------------------
+        # -----------------------------------------------
+        # EXACTEMENT comme le local :
+        # lire les performance logs en continu.
+        # -----------------------------------------------
 
-        maintenant = maintenant_marche()
-
-        heure_actuelle = (
-            maintenant
-            .time()
-            .replace(tzinfo=None)
-        )
-
-        date_actuelle = maintenant.date()
-
-        fenetres_alertes = [
-            ("11H", heure_onze, heure_onze_fin),
-            ("14H", heure_quatorze, heure_quatorze_fin),
-            ("16H", heure_seize, heure_seize_fin),
-        ]
-
-        for (
-            nom_fenetre,
-            debut,
-            fin,
-        ) in fenetres_alertes:
-
-            cle = (
-                date_actuelle,
-                nom_fenetre,
-            )
-
-            if (
-                debut <= heure_actuelle <= fin
-                and cle not in alertes_executees
-            ):
-                try:
-                    signale(
-                        driver_instance
-                    )
-
-                except Exception as exc:
-                    logger.exception(
-                        "Erreur pendant le contrôle portefeuille %s : %s",
-                        nom_fenetre,
-                        exc,
-                    )
-
-                alertes_executees.add(
-                    cle
-                )
-
-        # ----------------------------------------------------
-        # LECTURE DES ÉVÉNEMENTS RÉSEAU CHROME
-        # ----------------------------------------------------
-
-        logs = driver_instance.get_log(
+        data = driver.get_log(
             "performance"
         )
 
-        for log in logs:
-            try:
-                message = json.loads(
-                    log["message"]
-                ).get(
-                    "message",
-                    {},
-                )
+        for log in data:
 
-            except (
-                json.JSONDecodeError,
-                TypeError,
-                KeyError,
-            ):
+            try:
+                log_entry = json.loads(
+                    log["message"]
+                )[
+                    "message"
+                ]
+
+            except Exception:
                 continue
 
-            method = message.get(
+            method = log_entry.get(
                 "method"
             )
 
-            params = message.get(
+            params = log_entry.get(
                 "params",
                 {},
             )
 
-            # =================================================
-            # 1. MARKETDETAILS EST ENVOYÉ
-            # =================================================
+            # ===========================================
+            # NETWORK.RESPONSERECEIVED
+            # ===========================================
 
-            if method == "Network.requestWillBeSent":
-                request = params.get(
-                    "request",
-                    {},
-                )
-
-                url = request.get(
-                    "url",
-                    "",
-                )
-
-                if "MarketDetails.aspx" not in url:
-                    continue
-
-                request_id = params.get(
-                    "requestId"
-                )
-
-                if not request_id:
-                    continue
-
-                market_requests_en_cours[
-                    request_id
-                ] = {
-                    "url": url,
-                    "method": request.get(
-                        "method",
-                        "",
-                    ),
-                    "started_at": time_module.time(),
-                    "status": None,
-                }
-
-                compteur_marketdetails += 1
-
-                logger.info(
-                    "Mise à jour marché détectée #%s | "
-                    "method=%s | requestId=%s",
-                    compteur_marketdetails,
-                    request.get(
-                        "method",
-                        "",
-                    ),
-                    request_id,
-                )
-
-                continue
-
-            # =================================================
-            # 2. LE SERVEUR A RÉPONDU
-            # =================================================
-
-            if method == "Network.responseReceived":
-                request_id = params.get(
-                    "requestId"
-                )
-
-                if request_id not in market_requests_en_cours:
-                    continue
-
+            if (
+                method
+                == "Network.responseReceived"
+            ):
                 response = params.get(
                     "response",
                     {},
                 )
 
-                market_requests_en_cours[
-                    request_id
-                ]["status"] = response.get(
-                    "status"
-                )
-
-                market_requests_en_cours[
-                    request_id
-                ]["mime_type"] = response.get(
-                    "mimeType"
-                )
-
-                continue
-
-            # =================================================
-            # 3. LE BODY EST DISPONIBLE
-            # =================================================
-
-            if method == "Network.loadingFinished":
-                request_id = params.get(
-                    "requestId"
-                )
-
-                requete_info = market_requests_en_cours.pop(
-                    request_id,
-                    None,
-                )
-
-                if requete_info is None:
-                    continue
-
-                status = requete_info.get(
-                    "status"
+                url = response.get(
+                    "url",
+                    "",
                 )
 
                 if (
-                    status is not None
-                    and not (
-                        200 <= float(status) < 300
-                    )
+                    "MarketDetails.aspx"
+                    not in url
                 ):
-                    logger.warning(
-                        "MarketDetails terminé avec status=%s | requestId=%s",
-                        status,
-                        request_id,
-                    )
                     continue
 
-                response_body = get_response_body(
-                    driver_instance,
-                    request_id,
-                )
-
-                if not response_body:
-                    logger.warning(
-                        "MarketDetails terminé mais body vide | requestId=%s",
-                        request_id,
-                    )
-                    continue
-
-                logger.info(
-                    "Réponse MarketDetails complète reçue | "
-                    "requestId=%s | taille=%s caractères",
-                    request_id,
-                    len(response_body),
-                )
-
-                try:
-                    dernier_snapshot = traiter_reponse_marche(
-                        response_body,
-                        dernier_snapshot,
-                    )
-
-                except Exception as exc:
-                    logger.exception(
-                        "Erreur pendant le traitement MarketDetails "
-                        "requestId=%s : %s",
-                        request_id,
-                        exc,
-                    )
-
-                continue
-
-            # =================================================
-            # 4. ÉCHEC RÉSEAU
-            # =================================================
-
-            if method == "Network.loadingFailed":
                 request_id = params.get(
                     "requestId"
                 )
 
-                requete_info = market_requests_en_cours.pop(
+                if (
+                    not request_id
+                    or request_id
+                    in processed_ids
+                ):
+                    continue
+
+                runtime_state[
+                    "market_events_seen"
+                ] += 1
+
+                runtime_state[
+                    "last_market_event_at"
+                ] = maintenant_marche().isoformat()
+
+                logger.info(
+                    "MarketDetails reçu #%s | requestId=%s",
+                    runtime_state[
+                        "market_events_seen"
+                    ],
+                    request_id,
+                )
+
+                # ---------------------------------------
+                # Même tentative immédiate que le local
+                # ---------------------------------------
+
+                body = get_response_body(
+                    driver,
+                    request_id,
+                )
+
+                if body:
+
+                    traiter_marketdetails_body(
+                        body
+                    )
+
+                    marquer_traite(
+                        request_id
+                    )
+
+                    pending_marketdetails.pop(
+                        request_id,
+                        None,
+                    )
+
+                else:
+                    # Sur le PC local, le body est généralement
+                    # déjà disponible. Sur Render, on garde la
+                    # requête en attente au lieu de la perdre.
+                    pending_marketdetails[
+                        request_id
+                    ] = {
+                        "url": url,
+                        "created_at": time_module.time(),
+                    }
+
+                continue
+
+            # ===========================================
+            # NETWORK.LOADINGFINISHED
+            # Fallback Render uniquement.
+            # ===========================================
+
+            if (
+                method
+                == "Network.loadingFinished"
+            ):
+                request_id = params.get(
+                    "requestId"
+                )
+
+                if (
+                    request_id
+                    not in pending_marketdetails
+                    or request_id
+                    in processed_ids
+                ):
+                    continue
+
+                body = get_response_body(
+                    driver,
+                    request_id,
+                )
+
+                if body:
+
+                    logger.info(
+                        "Body MarketDetails récupéré au "
+                        "loadingFinished | requestId=%s",
+                        request_id,
+                    )
+
+                    traiter_marketdetails_body(
+                        body
+                    )
+
+                    marquer_traite(
+                        request_id
+                    )
+
+                else:
+                    logger.warning(
+                        "Body MarketDetails indisponible "
+                        "après loadingFinished | requestId=%s",
+                        request_id,
+                    )
+
+                pending_marketdetails.pop(
                     request_id,
                     None,
                 )
 
-                if requete_info is None:
-                    continue
+                continue
 
-                logger.warning(
-                    "Échec de chargement MarketDetails | "
-                    "requestId=%s | erreur=%s",
-                    request_id,
-                    params.get(
-                        "errorText"
-                    ),
-                )
+            # ===========================================
+            # NETWORK.LOADINGFAILED
+            # ===========================================
 
-        # ----------------------------------------------------
-        # NETTOYAGE DES REQUESTIDS TROP ANCIENS
-        # ----------------------------------------------------
-
-        maintenant_epoch = time_module.time()
-
-        requests_expires = [
-            request_id
-            for request_id, info
-            in market_requests_en_cours.items()
             if (
-                maintenant_epoch
-                - info.get(
-                    "started_at",
-                    maintenant_epoch,
+                method
+                == "Network.loadingFailed"
+            ):
+                request_id = params.get(
+                    "requestId"
                 )
-                > 60
+
+                if (
+                    request_id
+                    in pending_marketdetails
+                ):
+                    logger.warning(
+                        "MarketDetails réseau échoué "
+                        "| requestId=%s | erreur=%s",
+                        request_id,
+                        params.get(
+                            "errorText"
+                        ),
+                    )
+
+                    pending_marketdetails.pop(
+                        request_id,
+                        None,
+                    )
+
+        # -----------------------------------------------
+        # Nettoyage de sécurité
+        # -----------------------------------------------
+
+        expiration = (
+            time_module.time()
+            - 60
+        )
+
+        ids_expires = [
+            request_id
+            for (
+                request_id,
+                info,
+            ) in pending_marketdetails.items()
+            if info.get(
+                "created_at",
+                0,
             )
+            < expiration
         ]
 
-        for request_id in requests_expires:
-            market_requests_en_cours.pop(
+        for request_id in ids_expires:
+            pending_marketdetails.pop(
                 request_id,
                 None,
-            )
-
-            logger.warning(
-                "Requête MarketDetails expirée sans loadingFinished | "
-                "requestId=%s",
-                request_id,
             )
 
         time_module.sleep(
             LOOP_SLEEP_SECONDS
         )
 
+    logger.info(
+        "Fin du créneau de collecte."
+    )
+
 
 # ============================================================
-# 18. UNE SESSION COMPLETE CHROME + SGI
+# 23. SESSION CHROME
 # ============================================================
 
-def executer_session_collecte():
-    driver_instance = None
+def executer_session():
 
-    if not est_dans_fenetre_collecte():
-        return
+    driver = None
 
     try:
-        driver_instance = creer_driver()
+        driver = creer_driver()
 
-        start(
-            driver_instance
+        start_sgi(
+            driver
         )
 
         time_module.sleep(
             5
         )
 
-        assurer_connexion_sgi(
-            driver_instance
-        )
+        if not est_connecte(
+            driver,
+            timeout=3,
+        ):
+            signin(
+                driver
+            )
 
-        logger.info(
-            "Connexion SGI confirmée."
+        # Petite attente identique dans l'esprit du local
+        # avant d'entrer dans la boucle performance logs.
+        time_module.sleep(
+            2
         )
 
         collecte(
-            driver_instance
+            driver
         )
 
     finally:
-        if (
-            driver_instance is not None
-        ):
-            try:
-                driver_instance.quit()
 
+        if driver is not None:
+            try:
+                driver.quit()
             except Exception:
                 pass
 
 
 # ============================================================
-# 19. SUPERVISEUR RENDER
+# 24. MAIN RENDER
 # ============================================================
 
 def main():
+
     verifier_configuration()
 
-    # Render Web Service : ouvre le port HTTP dès le démarrage.
-    demarrer_serveur_render()
+    demarrer_health_server()
 
     logger.info(
         "=================================================="
     )
+
     logger.info(
-        "DÉMARRAGE COLLECTEUR BRVM SUR RENDER"
+        "BRVM RENDER + AIVEN"
     )
+
     logger.info(
-        "Destination : %s.%s",
-        AIVEN_MYSQL_DATABASE,
-        AIVEN_MYSQL_TABLE,
-    )
-    logger.info(
-        "Horaire : lundi-vendredi %s-%s | fuseau=%s",
-        COLLECT_START_TIME.strftime("%H:%M"),
-        COLLECT_END_TIME.strftime("%H:%M"),
+        "Collecte : lundi-vendredi %s-%s | %s",
+        COLLECT_START_TIME.strftime(
+            "%H:%M"
+        ),
+        COLLECT_END_TIME.strftime(
+            "%H:%M"
+        ),
         COLLECT_TIMEZONE_NAME,
     )
+
     logger.info(
-        "Premier ID : %s",
-        AIVEN_FIRST_ID,
+        "Logique réseau : identique au scraper local."
     )
-    logger.info(
-        "Seuil stockage configuré : %.2f Mo",
-        AIVEN_MAX_STORAGE_MB,
-    )
-    logger.info(
-        "Chrome headless : %s",
-        CHROME_HEADLESS,
-    )
+
     logger.info(
         "=================================================="
     )
 
     while True:
-        try:
-            # Hors horaires : ni Chrome ni collecte SQL.
-            attendre_fenetre_collecte()
 
-            # Nous ne préparons Aiven qu'au moment où le marché ouvre.
+        try:
+
+            attendre_ouverture()
+
             db.test_connection()
+
             db.ensure_table()
+
             db.check_storage_limit(
                 force=True
             )
 
-            logger.info(
-                "Ouverture du créneau : lancement Selenium."
-            )
+            executer_session()
 
-            executer_session_collecte()
-
-            # La fonction retourne normalement après 16h30.
             db.close()
 
         except StorageLimitReached as exc:
-            logger.critical(
-                "=================================================="
+
+            runtime_state[
+                "last_error"
+            ] = str(
+                exc
             )
-            logger.critical(
-                "ARRÊT VOLONTAIRE : LIMITE DE STOCKAGE"
-            )
+
             logger.critical(
                 "%s",
                 exc,
             )
-            logger.critical(
-                "=================================================="
-            )
 
             db.close()
-            sys.exit(99)
+
+            sys.exit(
+                99
+            )
 
         except KeyboardInterrupt:
-            logger.info(
-                "Arrêt manuel demandé."
-            )
 
             db.close()
-            sys.exit(0)
+
+            sys.exit(
+                0
+            )
 
         except Exception as exc:
+
+            runtime_state[
+                "last_error"
+            ] = str(
+                exc
+            )
+
             logger.exception(
-                "Erreur de session : %s",
+                "Erreur session : %s",
                 exc,
             )
 
             db.close()
 
-            # Si l'erreur arrive après la fermeture du marché,
-            # on ne boucle pas inutilement sur Selenium.
             if not est_dans_fenetre_collecte():
                 continue
 
             logger.info(
-                "Redémarrage automatique dans %s secondes...",
+                "Nouvelle session dans %s secondes.",
                 RESTART_DELAY_SECONDS,
             )
 
@@ -2438,9 +2193,8 @@ def main():
 
 
 # ============================================================
-# 20. POINT D'ENTRÉE
+# 25. POINT D'ENTREE
 # ============================================================
-
 
 if __name__ == "__main__":
     main()

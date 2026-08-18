@@ -1,10 +1,28 @@
+"""
+Analyse_function1_render.py
+
+Version Render/Linux allégée de Analyse_function1.py.
+
+Cette version conserve UNIQUEMENT la logique réellement utilisée
+par le scraper BRVM :
+- parsing des PAC_DET ;
+- mise à jour du cache actuel ;
+- historique profondeur ;
+- historique variation ;
+- historique transactions ;
+- traitement du bloc XML MKT.
+
+Aucune dépendance Windows :
+- pas de pyodbc ;
+- pas de winsound ;
+- pas de tkinter ;
+- pas d'Excel/OpenPyXL ;
+- pas de SQL Server local.
+"""
+
 import xml.etree.ElementTree as ET
-from pprint import pprint
-from datetime import datetime, time
-import csv
+from datetime import datetime
 
-
-# --- Fonctions d'aide pour le parsing (inchangées) ---
 def _try_parse_float(valeur_str):
     if valeur_str is None or valeur_str == '' or valeur_str == '0': return None
     try:
@@ -31,7 +49,6 @@ def _get_champ(champs, index, defaut=''):
         return champs[index].strip() if champs[index] is not None else defaut
     except IndexError: return defaut
 
-# --- Fonction pour parser une ligne PAC_DET et mettre à jour les caches ---
 def parse_et_maj_caches_specialises(pac_det_chaine, cache_actuel, hist_prof, hist_var, hist_trans):
     pac_det_chaine = pac_det_chaine.strip()
     maj_effectuee = False
@@ -210,7 +227,6 @@ def parse_et_maj_caches_specialises(pac_det_chaine, cache_actuel, hist_prof, his
         return False
     return maj_effectuee
 
-# --- Fonction pour traiter un bloc XML complet ---
 def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
     try:
         if isinstance(chaine_xml, str): chaine_xml_bytes = chaine_xml.encode('utf-8')
@@ -233,171 +249,3 @@ def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
         return True
     except ET.ParseError as e: print(f"ERREUR: Erreur de parsing XML: {e}"); return False
     except Exception as e: print(f"ERREUR: Erreur inattendue: {e}"); return False
-
-
-#............................ Fonctions pour exporter les données ...............................
-
-# --- Fonctions d'exportation ---
-
-def exporter_donnees_actuelles_csv(donnees_cache, nom_fichier="donnees_actuelles.csv"):
-    """Exporte le cache actuel des données de marché en CSV."""
-    if not donnees_cache:
-        print("Cache des données actuelles vide, rien à exporter en CSV.")
-        return
-
-    # Déterminer les en-têtes
-    # On prend les clés du premier instrument comme base, en espérant qu'ils soient cohérents
-    # Exclure les métadonnées commençant par '_'
-    cles_instruments = [k for k in donnees_cache.keys() if not k.startswith('_')]
-    if not cles_instruments:
-        print("Cache des données actuelles ne contient que des métadonnées, rien à exporter en CSV.")
-        return
-
-    premier_instrument = donnees_cache[cles_instruments[0]]
-    entetes_base = list(premier_instrument.keys())
-
-    # Gérer l'aplatissement du carnet d'ordres pour CSV
-    entetes_carnet = []
-    max_niveaux_carnet = 0
-    if 'carnet_ordres' in premier_instrument and premier_instrument['carnet_ordres']:
-        max_niveaux_carnet = len(premier_instrument['carnet_ordres']) # Supposons 5
-        for i in range(1, max_niveaux_carnet + 1):
-            entetes_carnet.extend([
-                f'carnet_nb_ordres_achat_{i}', f'carnet_qte_achat_{i}', f'carnet_cours_achat_{i}',
-                f'carnet_cours_vente_{i}', f'carnet_qte_vente_{i}', f'carnet_nb_ordres_vente_{i}'
-            ])
-    entetes_finales = [e for e in entetes_base if e != 'carnet_ordres'] + entetes_carnet
-
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes_finales, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_instrument in donnees_cache.items():
-            if mnemonique.startswith('_'): # Ignorer les métadonnées
-                continue
-            
-            ligne_aplanie = data_instrument.copy()
-            if 'carnet_ordres' in ligne_aplanie:
-                carnet = ligne_aplanie.pop('carnet_ordres') # Enlever la liste
-                for i, niveau in enumerate(carnet):
-                    if i < max_niveaux_carnet : # S'assurer de ne pas dépasser
-                        ligne_aplanie[f'carnet_nb_ordres_achat_{i+1}'] = niveau.get('nb_ordres_achat')
-                        ligne_aplanie[f'carnet_qte_achat_{i+1}'] = niveau.get('qte_achat')
-                        ligne_aplanie[f'carnet_cours_achat_{i+1}'] = niveau.get('cours_achat')
-                        ligne_aplanie[f'carnet_cours_vente_{i+1}'] = niveau.get('cours_vente')
-                        ligne_aplanie[f'carnet_qte_vente_{i+1}'] = niveau.get('qte_vente')
-                        ligne_aplanie[f'carnet_nb_ordres_vente_{i+1}'] = niveau.get('nb_ordres_vente')
-            writer.writerow(ligne_aplanie)
-    print(f"Données actuelles exportées vers {nom_fichier}")
-
-
-
-# --- Fonction pour traiter un bloc XML complet ---
-def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
-    try:
-        if isinstance(chaine_xml, str): chaine_xml_bytes = chaine_xml.encode('utf-8')
-        else: chaine_xml_bytes = chaine_xml
-        racine = ET.fromstring(chaine_xml_bytes)
-        type_msg_elem = racine.find('TYPE')
-        if racine.tag != 'REP' or type_msg_elem is None or type_msg_elem.text != 'MKT':
-            print(f"AVERT: Format XML racine ou TYPE inattendu.")
-            return False
-        pacq = racine.find('PACQ')
-        if pacq is None:
-            print("AVERT: Balise PACQ non trouvée.")
-            return False
-        maj_effectuees = 0
-        for pac_det in pacq.findall('PAC_DET'):
-            if pac_det.text:
-                if parse_et_maj_caches_specialises(pac_det.text, cache_actuel, hist_prof, hist_var, hist_trans):
-                    maj_effectuees += 1
-        # print(f"--- Bloc XML traité. {maj_effectuees} mises à jour détectées. Horodatage global: {cache_actuel.get('_metadata_horodatage_message', 'N/A')} ---")
-        return True
-    except ET.ParseError as e: print(f"ERREUR: Erreur de parsing XML: {e}"); return False
-    except Exception as e: print(f"ERREUR: Erreur inattendue: {e}"); return False
-
-
-def exporter_historique_profondeur_csv(historique, nom_fichier="hist_profondeur.csv"):
-    """Exporte l'historique de la profondeur du marché en CSV."""
-    if not historique:
-        print("Historique de profondeur vide, rien à exporter en CSV.")
-        return
-
-    entetes = ['mnemonique', 'horodatage_execution', 'horodatage_source_message',
-               'niveau_carnet', 'nb_ordres_achat', 'qte_achat', 'cours_achat',
-               'cours_vente', 'qte_vente', 'nb_ordres_vente']
-
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.writer(fichier_csv)
-        writer.writerow(entetes)
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                horodatage_source = data_exec.get('horodatage_source_message', '')
-                for i, niveau in enumerate(data_exec.get('carnet_ordres', [])):
-                    writer.writerow([
-                        mnemonique, horodatage_exec, horodatage_source, i + 1,
-                        niveau.get('nb_ordres_achat'), niveau.get('qte_achat'), niveau.get('cours_achat'),
-                        niveau.get('cours_vente'), niveau.get('qte_vente'), niveau.get('nb_ordres_vente')
-                    ])
-    print(f"Historique de profondeur exporté vers {nom_fichier}")
-
-
-def exporter_historique_variation_csv(historique, nom_fichier="hist_variation.csv"):
-    """Exporte l'historique des variations de marché en CSV."""
-    if not historique:
-        print("Historique de variation vide, rien à exporter en CSV.")
-        return
-
-    # Déterminer les en-têtes à partir du premier enregistrement
-    entetes_base = []
-    for mnemo_data in historique.values():
-        if mnemo_data:
-            first_ts_data = next(iter(mnemo_data.values()))
-            entetes_base = list(first_ts_data.keys())
-            break
-    if not entetes_base:
-        print("Aucune donnée dans l'historique de variation pour déterminer les en-têtes.")
-        return
-
-    entetes = ['mnemonique', 'horodatage_execution'] + entetes_base
-
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                ligne = {'mnemonique': mnemonique, 'horodatage_execution': horodatage_exec}
-                ligne.update(data_exec)
-                writer.writerow(ligne)
-    print(f"Historique de variation exporté vers {nom_fichier}")
-
-
-def exporter_historique_transactions_csv(historique, nom_fichier="hist_transactions.csv"):
-    """Exporte l'historique des transactions (interprétées) en CSV."""
-    if not historique:
-        print("Historique de transactions vide, rien à exporter en CSV.")
-        return
-    
-    entetes_base = []
-    for mnemo_data in historique.values():
-        if mnemo_data:
-            first_ts_data = next(iter(mnemo_data.values()))
-            entetes_base = list(first_ts_data.keys())
-            break
-    if not entetes_base:
-        print("Aucune donnée dans l'historique de transactions pour déterminer les en-têtes.")
-        return
-        
-    entetes = ['mnemonique', 'horodatage_execution'] + entetes_base
-
-    with open(nom_fichier, 'w', newline='', encoding='utf-8') as fichier_csv:
-        writer = csv.DictWriter(fichier_csv, fieldnames=entetes, extrasaction='ignore')
-        writer.writeheader()
-        for mnemonique, data_mnemo in historique.items():
-            for horodatage_exec, data_exec in data_mnemo.items():
-                ligne = {'mnemonique': mnemonique, 'horodatage_execution': horodatage_exec}
-                ligne.update(data_exec)
-                writer.writerow(ligne)
-    print(f"Historique de transactions exporté vers {nom_fichier}")
-
-import pandas as pd
-

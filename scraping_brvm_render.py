@@ -60,7 +60,12 @@ from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
+    TimeoutException,
 )
+
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
@@ -1365,6 +1370,14 @@ def creer_driver():
         options=options
     )
 
+    driver_instance.set_page_load_timeout(
+        25
+    )
+
+    driver_instance.implicitly_wait(
+        2
+    )
+
     return driver_instance
 
 
@@ -1380,54 +1393,77 @@ def start(
         SGI_BASE_URL
     )
 
-
 def est_connecte(
     driver_instance,
+    timeout=5,
 ):
     try:
-        driver_instance.find_element(
-            By.XPATH,
-            (
-                "/html/body/div[1]/div/div[3]"
-                "/table/tbody/tr/td[2]/div"
-            ),
+        WebDriverWait(
+            driver_instance,
+            timeout,
+        ).until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    (
+                        "/html/body/div[1]/div/div[3]"
+                        "/table/tbody/tr/td[2]/div"
+                    ),
+                )
+            )
         )
 
         return True
 
-    except NoSuchElementException:
+    except TimeoutException:
         return False
-
 
 def signin(
     driver_instance,
 ):
     logger.info(
-        "Connexion au compte SGI."
+        "Tentative de connexion au compte SGI."
     )
 
-    login_input = driver_instance.find_element(
-        By.XPATH,
-        (
-            "/html/body/div[1]/div[2]"
-            "/div[2]/input[1]"
-        ),
+    wait = WebDriverWait(
+        driver_instance,
+        30,
     )
 
-    password_input = driver_instance.find_element(
-        By.XPATH,
-        (
-            "/html/body/div[1]/div[2]"
-            "/div[2]/input[2]"
-        ),
+    login_input = wait.until(
+        EC.visibility_of_element_located(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[1]"
+                ),
+            )
+        )
     )
 
-    connect_button = driver_instance.find_element(
-        By.XPATH,
-        (
-            "/html/body/div[1]/div[2]"
-            "/div[2]/input[3]"
-        ),
+    password_input = wait.until(
+        EC.visibility_of_element_located(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[2]"
+                ),
+            )
+        )
+    )
+
+    connect_button = wait.until(
+        EC.element_to_be_clickable(
+            (
+                By.XPATH,
+                (
+                    "/html/body/div[1]/div[2]"
+                    "/div[2]/input[3]"
+                ),
+            )
+        )
     )
 
     login_input.clear()
@@ -1440,31 +1476,86 @@ def signin(
         SGI_PASSWORD
     )
 
+    logger.info(
+        "Formulaire SGI rempli."
+    )
+
     connect_button.click()
 
+    logger.info(
+        "Bouton de connexion SGI cliqué."
+    )
 
 def assurer_connexion_sgi(
     driver_instance,
 ):
+    # La session est peut-être déjà ouverte.
     if est_connecte(
-        driver_instance
+        driver_instance,
+        timeout=5,
     ):
-        return
+        logger.info(
+            "Session SGI déjà connectée."
+        )
+        return True
+
+    logger.info(
+        "Session SGI non connectée. "
+        "Tentative d'authentification."
+    )
 
     signin(
         driver_instance
     )
 
-    time_module.sleep(
-        3
-    )
-
-    if not est_connecte(
-        driver_instance
+    # On laisse maintenant jusqu'à 30 secondes au site
+    # pour terminer l'authentification.
+    if est_connecte(
+        driver_instance,
+        timeout=30,
     ):
-        raise RuntimeError(
-            "Impossible de confirmer la connexion SGI."
+        logger.info(
+            "Connexion SGI confirmée."
         )
+        return True
+
+    # ========================================================
+    # DIAGNOSTIC
+    # ========================================================
+
+    try:
+        logger.error(
+            "Échec connexion SGI | URL actuelle : %s",
+            driver_instance.current_url,
+        )
+
+        logger.error(
+            "Échec connexion SGI | Titre page : %s",
+            driver_instance.title,
+        )
+
+        body_text = driver_instance.find_element(
+            By.TAG_NAME,
+            "body",
+        ).text
+
+        # Seulement les 2000 premiers caractères.
+        # On évite de remplir les logs Render.
+        logger.error(
+            "Contenu visible de la page SGI : %s",
+            body_text[:2000],
+        )
+
+    except Exception as diagnostic_error:
+        logger.warning(
+            "Impossible de récupérer le diagnostic SGI : %s",
+            diagnostic_error,
+        )
+
+    raise RuntimeError(
+        "Impossible de confirmer la connexion SGI "
+        "après 30 secondes."
+    )
 
 
 def get_response_body(
@@ -2156,6 +2247,7 @@ def main():
 # ============================================================
 # 20. POINT D'ENTRÉE
 # ============================================================
+
 
 if __name__ == "__main__":
     main()

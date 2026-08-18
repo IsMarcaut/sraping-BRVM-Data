@@ -219,7 +219,7 @@ def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
         type_msg_elem = racine.find('TYPE')
         if racine.tag != 'REP' or type_msg_elem is None or type_msg_elem.text != 'MKT':
             print(f"AVERT: Format XML racine ou TYPE inattendu.")
-            return False
+            return True
         pacq = racine.find('PACQ')
         if pacq is None:
             print("AVERT: Balise PACQ non trouvée.")
@@ -229,8 +229,8 @@ def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
             if pac_det.text:
                 if parse_et_maj_caches_specialises(pac_det.text, cache_actuel, hist_prof, hist_var, hist_trans):
                     maj_effectuees += 1
-        # print(f"--- Bloc XML traité. {maj_effectuees} mises à jour détectées. Horodatage global: {cache_actuel.get('_metadata_horodatage_message', 'N/A')} ---")
-        return True
+                    # print(f"--- Bloc XML traité. {maj_effectuees} mises à jour détectées. Horodatage global: {cache_actuel.get('_metadata_horodatage_message', 'N/A')} ---")
+                    return True
     except ET.ParseError as e: print(f"ERREUR: Erreur de parsing XML: {e}"); return False
     except Exception as e: print(f"ERREUR: Erreur inattendue: {e}"); return False
 

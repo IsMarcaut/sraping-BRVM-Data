@@ -36,6 +36,7 @@ IMPORTANT :
     - Il utilise seulement traiter_bloc_xml().
 """
 
+import base64
 import copy
 import json
 import logging
@@ -215,34 +216,6 @@ LOOP_SLEEP_SECONDS = float(
     os.getenv(
         "LOOP_SLEEP_SECONDS",
         "0.25",
-    )
-)
-
-
-# ============================================================
-# POLLING ACTIF DES DONNEES DE MARCHE
-# ============================================================
-#
-# Le site SGI ne renvoie pas nécessairement MarketDetails.aspx
-# spontanément après la première connexion.
-#
-# Le scraper mémorise donc la requête MarketDetails.aspx observée
-# dans Chrome puis la rejoue périodiquement dans la même session.
-#
-# 2 secondes = détection quasi immédiate sans recharger toute la page.
-MARKET_POLL_SECONDS = float(
-    os.getenv(
-        "MARKET_POLL_SECONDS",
-        "2",
-    )
-)
-
-# Délai entre deux avertissements si la requête MarketDetails
-# n'a pas encore été détectée.
-MARKET_REQUEST_WARNING_SECONDS = int(
-    os.getenv(
-        "MARKET_REQUEST_WARNING_SECONDS",
-        "30",
     )
 )
 
@@ -427,12 +400,6 @@ def verifier_configuration():
     if OUTSIDE_WINDOW_CHECK_SECONDS < 5:
         raise RuntimeError(
             "OUTSIDE_WINDOW_CHECK_SECONDS doit être >= 5."
-        )
-
-
-    if MARKET_POLL_SECONDS < 0.5:
-        raise RuntimeError(
-            "MARKET_POLL_SECONDS doit être >= 0.5 seconde."
         )
 
     if AIVEN_CA_CERT:
@@ -1404,14 +1371,14 @@ def creer_driver():
         options=options
     )
 
-    driver_instance.set_page_load_timeout(
-        25
+    # Active explicitement le domaine Network CDP.
+    driver_instance.execute_cdp_cmd(
+        "Network.enable",
+        {}
     )
 
-    # Timeout utilisé par execute_async_script() pour rejouer
-    # la requête MarketDetails.aspx dans le navigateur.
-    driver_instance.set_script_timeout(
-        30
+    driver_instance.set_page_load_timeout(
+        25
     )
 
     driver_instance.implicitly_wait(
@@ -1602,6 +1569,11 @@ def get_response_body(
     driver_instance,
     request_id,
 ):
+    """
+    Récupère le body d'une réponse réseau APRÈS Network.loadingFinished.
+
+    Chrome peut parfois renvoyer le body encodé en base64.
+    """
     try:
         response = (
             driver_instance
@@ -1613,13 +1585,38 @@ def get_response_body(
             )
         )
 
-        return response.get(
+        body = response.get(
             "body"
         )
 
+        if not body:
+            return None
+
+        if response.get(
+            "base64Encoded"
+        ):
+            try:
+                body = base64.b64decode(
+                    body
+                ).decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "Impossible de décoder le body base64 "
+                    "requestId=%s : %s",
+                    request_id,
+                    exc,
+                )
+
+        return body
+
     except Exception as exc:
-        logger.debug(
-            "Body indisponible requestId=%s : %s",
+        logger.warning(
+            "Body indisponible après loadingFinished "
+            "requestId=%s : %s",
             request_id,
             exc,
         )
@@ -1627,213 +1624,8 @@ def get_response_body(
         return None
 
 
-
 # ============================================================
-# 14. POLLING ACTIF DE MARKETDETAILS.ASPX
-# ============================================================
-
-def _headers_fetch_autorises(headers):
-    """
-    Une requête Chrome contient beaucoup de headers que JavaScript
-    n'a pas le droit de définir manuellement (Host, Cookie,
-    Content-Length, Origin, Sec-*, etc.).
-
-    On ne conserve que les headers utiles au replay de la requête.
-    Les cookies de session SGI sont repris automatiquement grâce à
-    credentials="include".
-    """
-
-    if not isinstance(headers, dict):
-        return {}
-
-    resultat = {}
-
-    for cle, valeur in headers.items():
-        nom = str(cle).lower().strip()
-
-        if (
-            nom in {
-                "accept",
-                "content-type",
-                "x-requested-with",
-            }
-            or nom.startswith("x-")
-        ):
-            resultat[str(cle)] = str(valeur)
-
-    return resultat
-
-
-def extraire_requete_marketdetails(message):
-    """
-    Extrait la vraie requête MarketDetails.aspx depuis l'événement
-    Chrome Network.requestWillBeSent.
-
-    La requête capturée sera ensuite rejouée périodiquement sans
-    recharger toute la page.
-    """
-
-    if (
-        message.get("method")
-        != "Network.requestWillBeSent"
-    ):
-        return None
-
-    params = message.get(
-        "params",
-        {},
-    )
-
-    request = params.get(
-        "request",
-        {},
-    )
-
-    url = request.get(
-        "url",
-        "",
-    )
-
-    if (
-        "MarketDetails.aspx"
-        not in url
-    ):
-        return None
-
-    methode = (
-        request.get(
-            "method",
-            "GET",
-        )
-        or "GET"
-    ).upper()
-
-    return {
-        "url": url,
-        "method": methode,
-        "postData": request.get(
-            "postData"
-        ),
-        "headers": _headers_fetch_autorises(
-            request.get(
-                "headers",
-                {},
-            )
-        ),
-    }
-
-
-def rejouer_requete_marketdetails(
-    driver_instance,
-    market_request,
-):
-    """
-    Rejoue MarketDetails.aspx DIRECTEMENT depuis le navigateur.
-
-    Avantages :
-    - conserve la session/cookies SGI ;
-    - ne recharge pas toute l'interface ;
-    - récupère les données fraîches ;
-    - fonctionne même si le site ne déclenche plus spontanément
-      de nouvelle requête après la connexion.
-    """
-
-    if not market_request:
-        return None
-
-    script = r"""
-        const url = arguments[0];
-        const method = arguments[1];
-        const postData = arguments[2];
-        const headers = arguments[3];
-        const done = arguments[arguments.length - 1];
-
-        const options = {
-            method: method,
-            credentials: "include",
-            cache: "no-store",
-            headers: headers || {}
-        };
-
-        if (
-            method !== "GET" &&
-            method !== "HEAD" &&
-            postData !== null &&
-            postData !== undefined
-        ) {
-            options.body = postData;
-        }
-
-        fetch(url, options)
-            .then(async response => {
-                const body = await response.text();
-
-                done({
-                    ok: response.ok,
-                    status: response.status,
-                    url: response.url,
-                    body: body
-                });
-            })
-            .catch(error => {
-                done({
-                    ok: false,
-                    status: 0,
-                    error: String(error),
-                    body: null
-                });
-            });
-    """
-
-    try:
-        resultat = driver_instance.execute_async_script(
-            script,
-            market_request["url"],
-            market_request["method"],
-            market_request.get(
-                "postData"
-            ),
-            market_request.get(
-                "headers",
-                {},
-            ),
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "Impossible de rejouer MarketDetails.aspx : %s",
-            exc,
-        )
-        return None
-
-    if not isinstance(
-        resultat,
-        dict,
-    ):
-        return None
-
-    if not resultat.get(
-        "ok"
-    ):
-        logger.warning(
-            "Polling MarketDetails refusé | status=%s | erreur=%s",
-            resultat.get("status"),
-            resultat.get("error"),
-        )
-        return None
-
-    body = resultat.get(
-        "body"
-    )
-
-    if not body:
-        return None
-
-    return body
-
-
-# ============================================================
-# 15. ALERTES PORTEFEUILLE
+# 14. ALERTES PORTEFEUILLE
 # ============================================================
 
 def _normaliser_float(value):
@@ -1999,7 +1791,7 @@ def signale(
 
 
 # ============================================================
-# 16. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
+# 15. NETTOYAGE DES HISTORIQUES EN MÉMOIRE
 # ============================================================
 
 def limiter_historique_par_instrument(historique):
@@ -2047,51 +1839,8 @@ def nettoyer_historiques_memoire():
 
 
 # ============================================================
-# 17. TRAITEMENT DES RÉPONSES MARCHÉ
+# 16. TRAITEMENT DES RÉPONSES MARCHÉ
 # ============================================================
-
-def determiner_instruments_modifies(
-    snapshot_actuel,
-    dernier_snapshot,
-):
-    """
-    Première collecte :
-        -> tous les instruments sont enregistrés.
-
-    Collectes suivantes :
-        -> uniquement les instruments dont les données ont changé.
-
-    Cela évite de remplir Aiven avec 50/100 lignes identiques
-    lorsqu'un seul titre a changé.
-    """
-
-    if dernier_snapshot is None:
-        return copy.deepcopy(
-            snapshot_actuel
-        )
-
-    modifications = {}
-
-    for cle_instrument, donnees in snapshot_actuel.items():
-
-        anciennes_donnees = (
-            dernier_snapshot.get(
-                cle_instrument
-            )
-        )
-
-        if (
-            anciennes_donnees
-            != donnees
-        ):
-            modifications[
-                cle_instrument
-            ] = copy.deepcopy(
-                donnees
-            )
-
-    return modifications
-
 
 def traiter_reponse_marche(
     response_body,
@@ -2125,106 +1874,72 @@ def traiter_reponse_marche(
     if not snapshot_actuel:
         return dernier_snapshot
 
-    instruments_modifies = (
-        determiner_instruments_modifies(
-            snapshot_actuel,
-            dernier_snapshot,
-        )
-    )
+    if (
+        dernier_snapshot is not None
+        and snapshot_actuel == dernier_snapshot
+    ):
+        return dernier_snapshot
 
-    if not instruments_modifies:
-        logger.debug(
-            "MarketDetails reçu mais aucune modification réelle."
-        )
-
-        return snapshot_actuel
-
-    logger.info(
-        "%s instrument(s) modifié(s) détecté(s).",
-        len(instruments_modifies),
-    )
-
-    # IMPORTANT :
-    # On n'insère désormais que les lignes modifiées.
     db.insert_market_snapshot(
-        instruments_modifies
+        snapshot_actuel
     )
 
     return snapshot_actuel
 
 
 # ============================================================
-# 18. BOUCLE DE COLLECTE
+# 17. BOUCLE DE COLLECTE
 # ============================================================
 
 def collecte(
     driver_instance,
 ):
-    heure_onze = time(
-        11,
-        0,
-        0,
-    )
+    """
+    Collecte événementielle native du site SGI.
 
-    heure_onze_fin = time(
-        11,
-        1,
-        5,
-    )
+    À chaque modification de marché, le site envoie lui-même
+    un nouveau POST MarketDetails.aspx.
 
-    heure_quatorze = time(
-        14,
-        0,
-        0,
-    )
+    Cycle suivi :
+        Network.requestWillBeSent
+            -> mémoriser requestId
+        Network.responseReceived
+            -> mémoriser le statut HTTP
+        Network.loadingFinished
+            -> Network.getResponseBody(requestId)
+            -> traiter_bloc_xml()
+            -> comparaison du snapshot
+            -> INSERT Aiven uniquement si changement réel
 
-    heure_quatorze_fin = time(
-        14,
-        1,
-        5,
-    )
+    Aucun polling artificiel de MarketDetails.aspx n'est utilisé.
+    """
 
-    heure_seize = time(
-        16,
-        0,
-        0,
-    )
+    heure_onze = time(11, 0, 0)
+    heure_onze_fin = time(11, 1, 5)
 
-    heure_seize_fin = time(
-        16,
-        1,
-        5,
-    )
+    heure_quatorze = time(14, 0, 0)
+    heure_quatorze_fin = time(14, 1, 5)
+
+    heure_seize = time(16, 0, 0)
+    heure_seize_fin = time(16, 1, 5)
 
     dernier_snapshot = None
-
     alertes_executees = set()
-
     dernier_check_session = 0.0
 
-    # Requête HTTP réellement utilisée par le site
-    # pour récupérer les données BRVM.
-    market_request = None
+    # requestId -> informations de la requête MarketDetails
+    market_requests_en_cours = {}
 
-    # Dernier polling actif.
-    dernier_poll_marche = 0.0
-
-    # Evite de répéter le même warning chaque tour.
-    dernier_warning_requete = 0.0
+    compteur_marketdetails = 0
 
     logger.info(
-        "Boucle de collecte continue démarrée."
-    )
-
-    logger.info(
-        "Polling marché configuré toutes les %.2f secondes.",
-        MARKET_POLL_SECONDS,
+        "Boucle de collecte événementielle démarrée."
     )
 
     while True:
 
         # ----------------------------------------------------
-        # FIN DE LA SESSION HORS CRÉNEAU
+        # FIN IMMÉDIATE DE LA SESSION HORS CRÉNEAU
         # ----------------------------------------------------
 
         moment_marche = maintenant_marche()
@@ -2239,14 +1954,13 @@ def collecte(
                     "%Y-%m-%d %H:%M:%S %Z"
                 ),
             )
-
             return
 
-        now_epoch = time_module.time()
+        # ----------------------------------------------------
+        # VÉRIFICATION DE LA SESSION SGI
+        # ----------------------------------------------------
 
-        # ----------------------------------------------------
-        # VÉRIFICATION SESSION SGI
-        # ----------------------------------------------------
+        now_epoch = time_module.time()
 
         if (
             now_epoch
@@ -2262,13 +1976,13 @@ def collecte(
             )
 
         # ----------------------------------------------------
-        # CONTRÔLE STOCKAGE
+        # CONTRÔLE DU STOCKAGE
         # ----------------------------------------------------
 
         db.check_storage_limit()
 
         # ----------------------------------------------------
-        # ALERTES PORTEFEUILLE
+        # CONTRÔLES PORTEFEUILLE
         # ----------------------------------------------------
 
         maintenant = maintenant_marche()
@@ -2276,29 +1990,15 @@ def collecte(
         heure_actuelle = (
             maintenant
             .time()
-            .replace(
-                tzinfo=None
-            )
+            .replace(tzinfo=None)
         )
 
         date_actuelle = maintenant.date()
 
         fenetres_alertes = [
-            (
-                "11H",
-                heure_onze,
-                heure_onze_fin,
-            ),
-            (
-                "14H",
-                heure_quatorze,
-                heure_quatorze_fin,
-            ),
-            (
-                "16H",
-                heure_seize,
-                heure_seize_fin,
-            ),
+            ("11H", heure_onze, heure_onze_fin),
+            ("14H", heure_quatorze, heure_quatorze_fin),
+            ("16H", heure_seize, heure_seize_fin),
         ]
 
         for (
@@ -2313,11 +2013,8 @@ def collecte(
             )
 
             if (
-                debut
-                <= heure_actuelle
-                <= fin
-                and cle
-                not in alertes_executees
+                debut <= heure_actuelle <= fin
+                and cle not in alertes_executees
             ):
                 try:
                     signale(
@@ -2326,8 +2023,7 @@ def collecte(
 
                 except Exception as exc:
                     logger.exception(
-                        "Erreur pendant le contrôle "
-                        "portefeuille %s : %s",
+                        "Erreur pendant le contrôle portefeuille %s : %s",
                         nom_fenetre,
                         exc,
                     )
@@ -2337,7 +2033,7 @@ def collecte(
                 )
 
         # ----------------------------------------------------
-        # ÉVÉNEMENTS RÉSEAU CHROME
+        # LECTURE DES ÉVÉNEMENTS RÉSEAU CHROME
         # ----------------------------------------------------
 
         logs = driver_instance.get_log(
@@ -2345,7 +2041,6 @@ def collecte(
         )
 
         for log in logs:
-
             try:
                 message = json.loads(
                     log["message"]
@@ -2365,162 +2060,220 @@ def collecte(
                 "method"
             )
 
-            # =================================================
-            # 1. MEMORISATION DE LA REQUETE MARKETDETAILS
-            # =================================================
-
-            if (
-                method
-                == "Network.requestWillBeSent"
-            ):
-                requete_detectee = (
-                    extraire_requete_marketdetails(
-                        message
-                    )
-                )
-
-                if requete_detectee:
-
-                    # On ne logue à INFO que la première fois ou
-                    # si l'URL / méthode change.
-                    if (
-                        market_request is None
-                        or market_request.get("url")
-                        != requete_detectee.get("url")
-                        or market_request.get("method")
-                        != requete_detectee.get("method")
-                    ):
-                        logger.info(
-                            "Requête MarketDetails capturée | "
-                            "method=%s | url=%s",
-                            requete_detectee.get(
-                                "method"
-                            ),
-                            requete_detectee.get(
-                                "url"
-                            ),
-                        )
-
-                    market_request = (
-                        requete_detectee
-                    )
-
-                continue
-
-            # =================================================
-            # 2. TRAITEMENT DES REPONSES SPONTANEES DU SITE
-            # =================================================
-
-            if (
-                method
-                != "Network.responseReceived"
-            ):
-                continue
-
             params = message.get(
                 "params",
                 {},
             )
 
-            response = params.get(
-                "response",
-                {},
-            )
+            # =================================================
+            # 1. MARKETDETAILS EST ENVOYÉ
+            # =================================================
 
-            url = response.get(
-                "url",
-                "",
-            )
+            if method == "Network.requestWillBeSent":
+                request = params.get(
+                    "request",
+                    {},
+                )
 
-            if (
-                "MarketDetails.aspx"
-                not in url
-            ):
+                url = request.get(
+                    "url",
+                    "",
+                )
+
+                if "MarketDetails.aspx" not in url:
+                    continue
+
+                request_id = params.get(
+                    "requestId"
+                )
+
+                if not request_id:
+                    continue
+
+                market_requests_en_cours[
+                    request_id
+                ] = {
+                    "url": url,
+                    "method": request.get(
+                        "method",
+                        "",
+                    ),
+                    "started_at": time_module.time(),
+                    "status": None,
+                }
+
+                compteur_marketdetails += 1
+
+                logger.info(
+                    "Mise à jour marché détectée #%s | "
+                    "method=%s | requestId=%s",
+                    compteur_marketdetails,
+                    request.get(
+                        "method",
+                        "",
+                    ),
+                    request_id,
+                )
+
                 continue
 
-            request_id = params.get(
-                "requestId"
-            )
+            # =================================================
+            # 2. LE SERVEUR A RÉPONDU
+            # =================================================
 
-            if not request_id:
+            if method == "Network.responseReceived":
+                request_id = params.get(
+                    "requestId"
+                )
+
+                if request_id not in market_requests_en_cours:
+                    continue
+
+                response = params.get(
+                    "response",
+                    {},
+                )
+
+                market_requests_en_cours[
+                    request_id
+                ]["status"] = response.get(
+                    "status"
+                )
+
+                market_requests_en_cours[
+                    request_id
+                ]["mime_type"] = response.get(
+                    "mimeType"
+                )
+
                 continue
 
-            response_body = (
-                get_response_body(
+            # =================================================
+            # 3. LE BODY EST DISPONIBLE
+            # =================================================
+
+            if method == "Network.loadingFinished":
+                request_id = params.get(
+                    "requestId"
+                )
+
+                requete_info = market_requests_en_cours.pop(
+                    request_id,
+                    None,
+                )
+
+                if requete_info is None:
+                    continue
+
+                status = requete_info.get(
+                    "status"
+                )
+
+                if (
+                    status is not None
+                    and not (
+                        200 <= float(status) < 300
+                    )
+                ):
+                    logger.warning(
+                        "MarketDetails terminé avec status=%s | requestId=%s",
+                        status,
+                        request_id,
+                    )
+                    continue
+
+                response_body = get_response_body(
                     driver_instance,
                     request_id,
                 )
-            )
 
-            if not response_body:
+                if not response_body:
+                    logger.warning(
+                        "MarketDetails terminé mais body vide | requestId=%s",
+                        request_id,
+                    )
+                    continue
+
+                logger.info(
+                    "Réponse MarketDetails complète reçue | "
+                    "requestId=%s | taille=%s caractères",
+                    request_id,
+                    len(response_body),
+                )
+
+                try:
+                    dernier_snapshot = traiter_reponse_marche(
+                        response_body,
+                        dernier_snapshot,
+                    )
+
+                except Exception as exc:
+                    logger.exception(
+                        "Erreur pendant le traitement MarketDetails "
+                        "requestId=%s : %s",
+                        request_id,
+                        exc,
+                    )
+
                 continue
 
-            logger.debug(
-                "Réponse MarketDetails spontanée reçue."
-            )
+            # =================================================
+            # 4. ÉCHEC RÉSEAU
+            # =================================================
 
-            dernier_snapshot = (
-                traiter_reponse_marche(
-                    response_body,
-                    dernier_snapshot,
-                )
-            )
-
-        # ----------------------------------------------------
-        # 3. POLLING ACTIF
-        # ----------------------------------------------------
-        #
-        # Même si le site ne produit plus d'événement réseau,
-        # nous rejouons la requête MarketDetails dans la session
-        # authentifiée toutes les MARKET_POLL_SECONDS.
-        # ----------------------------------------------------
-
-        now_epoch = time_module.time()
-
-        if market_request is not None:
-
-            if (
-                now_epoch
-                - dernier_poll_marche
-                >= MARKET_POLL_SECONDS
-            ):
-                dernier_poll_marche = (
-                    now_epoch
+            if method == "Network.loadingFailed":
+                request_id = params.get(
+                    "requestId"
                 )
 
-                response_body = (
-                    rejouer_requete_marketdetails(
-                        driver_instance,
-                        market_request,
-                    )
+                requete_info = market_requests_en_cours.pop(
+                    request_id,
+                    None,
                 )
 
-                if response_body:
-
-                    dernier_snapshot = (
-                        traiter_reponse_marche(
-                            response_body,
-                            dernier_snapshot,
-                        )
-                    )
-
-        else:
-
-            if (
-                now_epoch
-                - dernier_warning_requete
-                >= MARKET_REQUEST_WARNING_SECONDS
-            ):
-                dernier_warning_requete = (
-                    now_epoch
-                )
+                if requete_info is None:
+                    continue
 
                 logger.warning(
-                    "La requête MarketDetails.aspx "
-                    "n'a pas encore été détectée. "
-                    "Le scraper continue d'écouter "
-                    "les événements réseau Chrome."
+                    "Échec de chargement MarketDetails | "
+                    "requestId=%s | erreur=%s",
+                    request_id,
+                    params.get(
+                        "errorText"
+                    ),
                 )
+
+        # ----------------------------------------------------
+        # NETTOYAGE DES REQUESTIDS TROP ANCIENS
+        # ----------------------------------------------------
+
+        maintenant_epoch = time_module.time()
+
+        requests_expires = [
+            request_id
+            for request_id, info
+            in market_requests_en_cours.items()
+            if (
+                maintenant_epoch
+                - info.get(
+                    "started_at",
+                    maintenant_epoch,
+                )
+                > 60
+            )
+        ]
+
+        for request_id in requests_expires:
+            market_requests_en_cours.pop(
+                request_id,
+                None,
+            )
+
+            logger.warning(
+                "Requête MarketDetails expirée sans loadingFinished | "
+                "requestId=%s",
+                request_id,
+            )
 
         time_module.sleep(
             LOOP_SLEEP_SECONDS
@@ -2528,7 +2281,7 @@ def collecte(
 
 
 # ============================================================
-# 19. UNE SESSION COMPLETE CHROME + SGI
+# 18. UNE SESSION COMPLETE CHROME + SGI
 # ============================================================
 
 def executer_session_collecte():
@@ -2572,7 +2325,7 @@ def executer_session_collecte():
 
 
 # ============================================================
-# 20. SUPERVISEUR RENDER
+# 19. SUPERVISEUR RENDER
 # ============================================================
 
 def main():
@@ -2685,7 +2438,7 @@ def main():
 
 
 # ============================================================
-# 21. POINT D'ENTRÉE
+# 20. POINT D'ENTRÉE
 # ============================================================
 
 

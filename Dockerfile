@@ -54,7 +54,8 @@ COPY . /app
 # UTILISATEUR NON ROOT
 # ============================================================
 
-RUN useradd --create-home --uid 10001 appuser \
+RUN groupadd -g 1000 rendersecrets \
+    && useradd --create-home --uid 10001 --groups 1000 appuser \
     && chown -R appuser:appuser /app
 
 USER appuser

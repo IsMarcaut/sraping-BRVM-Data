@@ -228,24 +228,55 @@ def parse_et_maj_caches_specialises(pac_det_chaine, cache_actuel, hist_prof, his
     return maj_effectuee
 
 def traiter_bloc_xml(chaine_xml, cache_actuel, hist_prof, hist_var, hist_trans):
+    """
+    Traite uniquement les messages REP / TYPE in {"MKT", "MKT_MAJ"} / PACQ.
+
+    Les autres réponses de MarketDetails.aspx sont simplement ignorées.
+    Le scraper Render se charge de distinguer les réponses normales
+    non-MKT des vraies anomalies.
+    """
     try:
-        if isinstance(chaine_xml, str): chaine_xml_bytes = chaine_xml.encode('utf-8')
-        else: chaine_xml_bytes = chaine_xml
+        if isinstance(chaine_xml, str):
+            chaine_xml_bytes = chaine_xml.encode("utf-8")
+        else:
+            chaine_xml_bytes = chaine_xml
+
         racine = ET.fromstring(chaine_xml_bytes)
-        type_msg_elem = racine.find('TYPE')
-        if racine.tag != 'REP' or type_msg_elem is None or type_msg_elem.text != 'MKT':
-            print(f"AVERT: Format XML racine ou TYPE inattendu.")
+
+        type_msg_elem = racine.find("TYPE")
+        type_message = (
+            (type_msg_elem.text or "").strip()
+            if type_msg_elem is not None
+            else ""
+        )
+
+        types_acceptes = {"MKT", "MKT_MAJ"}
+
+        if (
+            racine.tag != "REP"
+            or type_message not in types_acceptes
+        ):
             return False
-        pacq = racine.find('PACQ')
+
+        pacq = racine.find("PACQ")
+
         if pacq is None:
-            print("AVERT: Balise PACQ non trouvée.")
             return False
-        maj_effectuees = 0
-        for pac_det in pacq.findall('PAC_DET'):
+
+        for pac_det in pacq.findall("PAC_DET"):
             if pac_det.text:
-                if parse_et_maj_caches_specialises(pac_det.text, cache_actuel, hist_prof, hist_var, hist_trans):
-                    maj_effectuees += 1
-        # print(f"--- Bloc XML traité. {maj_effectuees} mises à jour détectées. Horodatage global: {cache_actuel.get('_metadata_horodatage_message', 'N/A')} ---")
+                parse_et_maj_caches_specialises(
+                    pac_det.text,
+                    cache_actuel,
+                    hist_prof,
+                    hist_var,
+                    hist_trans,
+                )
+
         return True
-    except ET.ParseError as e: print(f"ERREUR: Erreur de parsing XML: {e}"); return False
-    except Exception as e: print(f"ERREUR: Erreur inattendue: {e}"); return False
+
+    except ET.ParseError:
+        return False
+
+    except Exception:
+        return False

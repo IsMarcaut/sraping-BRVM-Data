@@ -46,6 +46,7 @@ import re
 import sys
 import threading
 import time as time_module
+import xml.etree.ElementTree as ET
 
 from collections import deque
 from datetime import datetime, time, timedelta
@@ -378,11 +379,22 @@ if not logger.handlers:
 runtime_state = {
     "market_events_seen": 0,
     "market_bodies_processed": 0,
+    "market_bodies_ignored": 0,
+    "market_body_errors": 0,
     "rows_inserted": 0,
     "last_market_event_at": None,
     "last_insert_at": None,
     "last_error": None,
 }
+
+last_market_body_warning_at = 0.0
+
+MARKET_BODY_WARNING_INTERVAL_SECONDS = int(
+    os.getenv(
+        "MARKET_BODY_WARNING_INTERVAL_SECONDS",
+        "60",
+    )
+)
 
 
 # ============================================================
@@ -1651,7 +1663,170 @@ def nettoyer_historiques_ram():
 
 
 # ============================================================
-# 21. TRAITEMENT D'UNE REPONSE
+# 21. CLASSIFICATION DES REPONSES MARKETDETAILS
+# ============================================================
+
+def classifier_marketdetails_body(
+    response_body,
+):
+    """
+    MarketDetails.aspx peut renvoyer plusieurs types de réponses.
+
+    Retour :
+      ("mkt", detail)    -> vrai flux marché exploitable (MKT ou MKT_MAJ)
+      ("ignore", detail) -> réponse valide mais non-MKT
+      ("error", detail)  -> réponse réellement anormale
+    """
+
+    if response_body is None:
+        return (
+            "error",
+            "body absent",
+        )
+
+    if isinstance(
+        response_body,
+        bytes,
+    ):
+        texte = response_body.decode(
+            "utf-8",
+            errors="replace",
+        )
+    else:
+        texte = str(
+            response_body
+        )
+
+    texte = texte.strip()
+
+    if not texte:
+        return (
+            "error",
+            "body vide",
+        )
+
+    debut = texte[
+        :500
+    ].lower()
+
+    if (
+        "<html" in debut
+        or "<!doctype html" in debut
+    ):
+        return (
+            "error",
+            "réponse HTML au lieu du XML marché",
+        )
+
+    try:
+        racine = ET.fromstring(
+            texte.encode(
+                "utf-8"
+            )
+        )
+
+    except ET.ParseError as exc:
+        return (
+            "error",
+            f"XML invalide: {exc}",
+        )
+
+    type_elem = racine.find(
+        "TYPE"
+    )
+
+    type_message = (
+        (type_elem.text or "").strip()
+        if type_elem is not None
+        else ""
+    )
+
+    if racine.tag != "REP":
+        return (
+            "ignore",
+            f"racine={racine.tag!r}",
+        )
+
+    types_acceptes = {"MKT", "MKT_MAJ"}
+
+    if type_message not in types_acceptes:
+        return (
+            "ignore",
+            f"TYPE={type_message!r}",
+        )
+
+    pacq = racine.find(
+        "PACQ"
+    )
+
+    if pacq is None:
+        return (
+            "ignore",
+            "REP/MKT sans PACQ",
+        )
+
+    return (
+        "mkt",
+        f"PAC_DET={len(pacq.findall('PAC_DET'))}",
+    )
+
+
+def journaliser_body_anormal(
+    detail,
+    response_body,
+):
+    """
+    Journalise les vraies anomalies au maximum une fois par minute
+    par défaut, au lieu de saturer les logs Render.
+    """
+
+    global last_market_body_warning_at
+
+    runtime_state[
+        "market_body_errors"
+    ] += 1
+
+    maintenant = time_module.time()
+
+    if (
+        maintenant
+        - last_market_body_warning_at
+        < MARKET_BODY_WARNING_INTERVAL_SECONDS
+    ):
+        return
+
+    last_market_body_warning_at = (
+        maintenant
+    )
+
+    try:
+        apercu = str(
+            response_body
+        )[
+            :180
+        ].replace(
+            "\\n",
+            " "
+        ).replace(
+            "\\r",
+            " "
+        )
+    except Exception:
+        apercu = "<indisponible>"
+
+    logger.warning(
+        "Réponse MarketDetails anormale | %s | aperçu=%r "
+        "| total_anomalies=%s",
+        detail,
+        apercu,
+        runtime_state[
+            "market_body_errors"
+        ],
+    )
+
+
+# ============================================================
+# 22. TRAITEMENT D'UNE REPONSE MKT
 # ============================================================
 
 def traiter_marketdetails_body(
@@ -1680,6 +1855,32 @@ def traiter_marketdetails_body(
         ]
     )
 
+    classification, detail = (
+        classifier_marketdetails_body(
+            response_body
+        )
+    )
+
+    if classification == "ignore":
+        runtime_state[
+            "market_bodies_ignored"
+        ] += 1
+
+        logger.debug(
+            "MarketDetails ignoré normalement | %s",
+            detail,
+        )
+
+        return
+
+    if classification == "error":
+        journaliser_body_anormal(
+            detail,
+            response_body,
+        )
+
+        return
+
     resultat = traiter_bloc_xml(
         response_body,
         donnees_marche_cache_actuel,
@@ -1689,9 +1890,11 @@ def traiter_marketdetails_body(
     )
 
     if not resultat:
-        logger.warning(
-            "Bloc MarketDetails reçu mais XML non traité."
+        journaliser_body_anormal(
+            "REP/(MKT|MKT_MAJ)/PACQ validé mais parseur a retourné False",
+            response_body,
         )
+
         return
 
     nettoyer_historiques_ram()

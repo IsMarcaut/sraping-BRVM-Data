@@ -2347,6 +2347,7 @@ def main():
             ] = str(
                 exc
             )
+            
 
             logger.critical(
                 "%s",

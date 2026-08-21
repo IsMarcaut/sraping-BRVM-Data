@@ -38,6 +38,7 @@ Différences nécessaires pour Render :
 """
 
 import base64
+import gc
 import json
 import logging
 import math
@@ -337,6 +338,48 @@ MAX_PENDING_REQUESTS = int(
 
 
 # ============================================================
+# MODE MEMOIRE MINIMALE RENDER
+# ============================================================
+#
+# Sur Render, Aiven est la persistance réelle. Il n'est donc pas utile
+# de conserver en RAM des centaines de snapshots XML + historiques
+# profondeur/variation/transactions comme sur le PC local.
+RENDER_MINIMAL_MEMORY = (
+    os.getenv(
+        "RENDER_MINIMAL_MEMORY",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+# Si aucun MarketDetails n'arrive pendant ce délai après que le flux
+# a déjà démarré, on considère que la session SGI / le flux s'est figé
+# et on redémarre complètement Chromium.
+MARKET_SILENCE_TIMEOUT_SECONDS = int(
+    os.getenv(
+        "MARKET_SILENCE_TIMEOUT_SECONDS",
+        "90",
+    )
+)
+
+# Délai maximal après connexion pour recevoir le premier MarketDetails.
+MARKET_STARTUP_GRACE_SECONDS = int(
+    os.getenv(
+        "MARKET_STARTUP_GRACE_SECONDS",
+        "120",
+    )
+)
+
+# Diagnostic mémoire Linux périodique.
+MEMORY_CHECK_SECONDS = int(
+    os.getenv(
+        "MEMORY_CHECK_SECONDS",
+        "60",
+    )
+)
+
+
+# ============================================================
 # 8. LOGGING
 # ============================================================
 
@@ -394,6 +437,7 @@ runtime_state = {
     "rows_inserted": 0,
     "last_market_event_at": None,
     "last_insert_at": None,
+    "memory_tree_rss_mb": None,
     "last_error": None,
 }
 
@@ -1123,7 +1167,176 @@ historical_data = deque(
 
 
 # ============================================================
-# 15. HORAIRES
+# 15. DIAGNOSTIC MEMOIRE LINUX
+# ============================================================
+
+def _lire_proc_status(
+    pid,
+):
+    """
+    Lit PPid et VmRSS depuis /proc/<pid>/status.
+    Fonctionne sur Linux/Render sans dépendance supplémentaire.
+    """
+    try:
+        status_path = Path(
+            f"/proc/{pid}/status"
+        )
+
+        contenu = status_path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
+
+        ppid = None
+        rss_kb = 0
+
+        for ligne in contenu.splitlines():
+
+            if ligne.startswith(
+                "PPid:"
+            ):
+                ppid = int(
+                    ligne.split(
+                        ":",
+                        1,
+                    )[1].strip()
+                )
+
+            elif ligne.startswith(
+                "VmRSS:"
+            ):
+                morceaux = (
+                    ligne.split(
+                        ":",
+                        1,
+                    )[1]
+                    .strip()
+                    .split()
+                )
+
+                if morceaux:
+                    rss_kb = int(
+                        morceaux[0]
+                    )
+
+        return (
+            ppid,
+            rss_kb,
+        )
+
+    except Exception:
+        return (
+            None,
+            0,
+        )
+
+
+def get_process_tree_rss_mb():
+    """
+    Somme approximative de la mémoire RSS du processus Python
+    et de tous ses descendants Chromium/ChromeDriver.
+    """
+    try:
+        processus = {}
+
+        for entree in Path(
+            "/proc"
+        ).iterdir():
+
+            if not entree.name.isdigit():
+                continue
+
+            pid = int(
+                entree.name
+            )
+
+            ppid, rss_kb = (
+                _lire_proc_status(
+                    pid
+                )
+            )
+
+            if ppid is None:
+                continue
+
+            processus[
+                pid
+            ] = {
+                "ppid": ppid,
+                "rss_kb": rss_kb,
+            }
+
+        racine = os.getpid()
+
+        descendants = {
+            racine
+        }
+
+        changement = True
+
+        while changement:
+            changement = False
+
+            for (
+                pid,
+                info,
+            ) in processus.items():
+
+                if (
+                    pid not in descendants
+                    and info[
+                        "ppid"
+                    ] in descendants
+                ):
+                    descendants.add(
+                        pid
+                    )
+
+                    changement = True
+
+        total_kb = sum(
+            processus.get(
+                pid,
+                {},
+            ).get(
+                "rss_kb",
+                0,
+            )
+            for pid in descendants
+        )
+
+        return round(
+            total_kb
+            / 1024,
+            1,
+        )
+
+    except Exception:
+        return None
+
+
+def purger_memoires_transitoires():
+    """
+    Sur Render/Aiven, les historiques en RAM n'ont pas besoin d'être
+    conservés : chaque snapshot exploitable est déjà persisté dans Aiven.
+
+    Le cache courant du marché, lui, est conservé.
+    """
+    if not RENDER_MINIMAL_MEMORY:
+        nettoyer_historiques_ram()
+        return
+
+    historique_profondeur_marche.clear()
+    historique_variation_marche.clear()
+    historique_transactions.clear()
+
+    historical_data.clear()
+
+    gc.collect()
+
+
+# ============================================================
+# 16. HORAIRES
 # ============================================================
 
 def maintenant_marche():
@@ -2026,8 +2239,6 @@ def traiter_marketdetails_body(
 
         return
 
-    nettoyer_historiques_ram()
-
     runtime_state[
         "market_bodies_processed"
     ] += 1
@@ -2037,6 +2248,11 @@ def traiter_marketdetails_body(
     db.insert_market_snapshot(
         donnees_marche_cache_actuel
     )
+
+    # IMPORTANT Render :
+    # le snapshot est désormais persistant dans Aiven, donc les gros
+    # historiques temporaires peuvent être libérés immédiatement.
+    purger_memoires_transitoires()
 
 
 # ============================================================
@@ -2060,6 +2276,13 @@ def collecte(
 
     dernier_check_session = 0.0
     dernier_check_browser = 0.0
+    dernier_check_memoire = 0.0
+
+    collecte_started_epoch = (
+        time_module.time()
+    )
+
+    dernier_market_event_epoch = None
 
     # Fallback :
     # si responseReceived arrive un peu avant que le body soit
@@ -2168,6 +2391,34 @@ def collecte(
             )
 
         # -----------------------------------------------
+        # Diagnostic mémoire Python + Chromium
+        # -----------------------------------------------
+
+        if (
+            maintenant_epoch
+            - dernier_check_memoire
+            >= MEMORY_CHECK_SECONDS
+        ):
+            memoire_mb = (
+                get_process_tree_rss_mb()
+            )
+
+            runtime_state[
+                "memory_tree_rss_mb"
+            ] = memoire_mb
+
+            logger.info(
+                "Mémoire Python+Chrome | RSS≈%s Mo | "
+                "mode_minimal=%s",
+                memoire_mb,
+                RENDER_MINIMAL_MEMORY,
+            )
+
+            dernier_check_memoire = (
+                maintenant_epoch
+            )
+
+        # -----------------------------------------------
         # Stockage Aiven
         # -----------------------------------------------
 
@@ -2245,6 +2496,10 @@ def collecte(
                 runtime_state[
                     "last_market_event_at"
                 ] = maintenant_marche().isoformat()
+
+                dernier_market_event_epoch = (
+                    time_module.time()
+                )
 
                 logger.info(
                     "MarketDetails reçu #%s | requestId=%s",
@@ -2404,6 +2659,56 @@ def collecte(
                 request_id,
                 None,
             )
+
+        # -----------------------------------------------
+        # WATCHDOG DU FLUX MARKETDETAILS
+        # -----------------------------------------------
+        #
+        # Une déconnexion SGI côté serveur peut laisser l'ancien DOM
+        # "connecté" à l'écran. est_connecte() peut alors rester True
+        # alors que plus aucun MarketDetails n'arrive.
+        #
+        # On ne dépend donc pas uniquement du DOM : si le flux marché
+        # devient silencieux, on force un redémarrage COMPLET de la
+        # session Chromium. Le finally d'executer_session() fermera
+        # le driver, puis main() relancera une authentification propre.
+        # -----------------------------------------------
+
+        maintenant_epoch = (
+            time_module.time()
+        )
+
+        if dernier_market_event_epoch is None:
+
+            if (
+                maintenant_epoch
+                - collecte_started_epoch
+                >= MARKET_STARTUP_GRACE_SECONDS
+            ):
+                raise RuntimeError(
+                    "Aucun MarketDetails reçu pendant "
+                    f"{MARKET_STARTUP_GRACE_SECONDS}s après "
+                    "le démarrage de la collecte. "
+                    "Redémarrage de la session SGI."
+                )
+
+        else:
+
+            silence = (
+                maintenant_epoch
+                - dernier_market_event_epoch
+            )
+
+            if (
+                silence
+                >= MARKET_SILENCE_TIMEOUT_SECONDS
+            ):
+                raise RuntimeError(
+                    "Flux MarketDetails silencieux depuis "
+                    f"{silence:.0f}s. "
+                    "Session SGI probablement expirée ou figée. "
+                    "Redémarrage complet de Chromium."
+                )
 
         time_module.sleep(
             LOOP_SLEEP_SECONDS

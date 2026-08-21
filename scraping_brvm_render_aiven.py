@@ -241,6 +241,43 @@ SESSION_CHECK_SECONDS = int(
 )
 
 
+# ============================================================
+# RECONNEXION SGI ROBUSTE
+# ============================================================
+
+SGI_RECONNECT_MAX_ATTEMPTS = int(
+    os.getenv(
+        "SGI_RECONNECT_MAX_ATTEMPTS",
+        "3",
+    )
+)
+
+SGI_RECONNECT_DELAY_SECONDS = float(
+    os.getenv(
+        "SGI_RECONNECT_DELAY_SECONDS",
+        "2",
+    )
+)
+
+SGI_LOGIN_CONFIRM_TIMEOUT_SECONDS = int(
+    os.getenv(
+        "SGI_LOGIN_CONFIRM_TIMEOUT_SECONDS",
+        "30",
+    )
+)
+
+# Lorsque la SGI ferme volontairement la session, la page peut rester
+# dans un état DOM intermédiaire. On revient alors explicitement vers
+# SGI_BASE_URL avant de tenter une nouvelle authentification.
+SGI_FORCE_HOME_ON_DISCONNECT = (
+    os.getenv(
+        "SGI_FORCE_HOME_ON_DISCONNECT",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+
 # Diagnostic périodique de la page Chromium.
 # Permet de vérifier si Chrome considère la page SGI comme visible/active.
 BROWSER_HEALTH_CHECK_SECONDS = int(
@@ -482,6 +519,9 @@ runtime_state = {
     "last_snapshot_rejected": 0,
     "last_market_event_at": None,
     "last_insert_at": None,
+    "sgi_reconnect_count": 0,
+    "last_sgi_reconnect_at": None,
+    "last_sgi_state": None,
     "memory_tree_rss_mb": None,
     "last_error": None,
 }
@@ -564,6 +604,17 @@ def verifier_configuration():
     if ROW_REJECT_NULL_COUNT < 1:
         raise RuntimeError(
             "ROW_REJECT_NULL_COUNT doit être >= 1."
+        )
+
+
+    if SGI_RECONNECT_MAX_ATTEMPTS < 1:
+        raise RuntimeError(
+            "SGI_RECONNECT_MAX_ATTEMPTS doit être >= 1."
+        )
+
+    if SGI_RECONNECT_DELAY_SECONDS < 0:
+        raise RuntimeError(
+            "SGI_RECONNECT_DELAY_SECONDS doit être >= 0."
         )
 
     ca_path = Path(
@@ -2143,39 +2194,233 @@ def start_sgi(
     )
 
 
+def _element_visible(
+    driver,
+    xpath,
+):
+    """
+    Test léger sans WebDriverWait long.
+    """
+    try:
+        elements = driver.find_elements(
+            By.XPATH,
+            xpath,
+        )
+
+        for element in elements:
+            try:
+                if element.is_displayed():
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    except Exception:
+        return False
+
+
+def etat_session_sgi(
+    driver,
+):
+    """
+    Retourne :
+      - "connected" : interface authentifiée visible
+      - "login"     : formulaire de connexion visible
+      - "unknown"   : page intermédiaire / expirée / chargement / erreur
+
+    Cette distinction est plus robuste que l'ancien booléen
+    est_connecte().
+    """
+
+    if _element_visible(
+        driver,
+        XPATH_CONNECTE,
+    ):
+        etat = "connected"
+
+    elif (
+        _element_visible(
+            driver,
+            XPATH_LOGIN,
+        )
+        and _element_visible(
+            driver,
+            XPATH_PASSWORD,
+        )
+        and _element_visible(
+            driver,
+            XPATH_CONNECT_BUTTON,
+        )
+    ):
+        etat = "login"
+
+    else:
+        etat = "unknown"
+
+    runtime_state[
+        "last_sgi_state"
+    ] = etat
+
+    return etat
+
+
 def est_connecte(
     driver,
     timeout=5,
 ):
-    try:
-        WebDriverWait(
-            driver,
+    """
+    Compatibilité avec le reste du code.
+    Attend au maximum timeout secondes que l'état devienne connected.
+    """
+
+    fin = (
+        time_module.time()
+        + max(
+            0,
             timeout,
-        ).until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    XPATH_CONNECTE,
-                )
+        )
+    )
+
+    while True:
+
+        if (
+            etat_session_sgi(
+                driver
+            )
+            == "connected"
+        ):
+            return True
+
+        if (
+            time_module.time()
+            >= fin
+        ):
+            return False
+
+        time_module.sleep(
+            0.25
+        )
+
+
+def attendre_etat_sgi(
+    driver,
+    etats_acceptes,
+    timeout,
+):
+    """
+    Attend l'un des états SGI demandés.
+    """
+
+    fin = (
+        time_module.time()
+        + timeout
+    )
+
+    while (
+        time_module.time()
+        < fin
+    ):
+
+        etat = (
+            etat_session_sgi(
+                driver
             )
         )
 
-        return True
+        if (
+            etat
+            in etats_acceptes
+        ):
+            return etat
 
-    except TimeoutException:
-        return False
+        time_module.sleep(
+            0.25
+        )
+
+    return etat_session_sgi(
+        driver
+    )
+
+
+def ouvrir_page_connexion_sgi(
+    driver,
+):
+    """
+    Remet explicitement Chromium sur la page SGI.
+
+    Après une expiration côté serveur, le DOM précédent peut rester
+    affiché alors que la session n'est plus valide.
+    """
+
+    logger.info(
+        "Réinitialisation de la page SGI pour reconnexion."
+    )
+
+    driver.get(
+        SGI_BASE_URL
+    )
+
+    maintenir_page_chrome_active(
+        driver
+    )
+
+    etat = attendre_etat_sgi(
+        driver,
+        {
+            "connected",
+            "login",
+        },
+        timeout=20,
+    )
+
+    return etat
 
 
 def signin(
     driver,
 ):
+    """
+    Une tentative d'authentification.
+
+    Cette fonction ne décide plus seule de tuer la session Chromium :
+    reconnecter_sgi() orchestre plusieurs tentatives.
+    """
+
     logger.info(
         "Authentification SGI."
     )
 
+    # Si la page est déjà connectée entre-temps, aucune action.
+    if (
+        etat_session_sgi(
+            driver
+        )
+        == "connected"
+    ):
+        return True
+
+    # Le formulaire doit réellement être visible.
+    etat = attendre_etat_sgi(
+        driver,
+        {
+            "connected",
+            "login",
+        },
+        timeout=10,
+    )
+
+    if etat == "connected":
+        return True
+
+    if etat != "login":
+        raise RuntimeError(
+            "Formulaire SGI indisponible pour authentification."
+        )
+
     wait = WebDriverWait(
         driver,
-        30,
+        15,
     )
 
     login = wait.until(
@@ -2217,9 +2462,20 @@ def signin(
 
     bouton.click()
 
-    if not est_connecte(
-        driver,
-        timeout=30,
+    etat_apres_login = (
+        attendre_etat_sgi(
+            driver,
+            {
+                "connected",
+                "login",
+            },
+            timeout=SGI_LOGIN_CONFIRM_TIMEOUT_SECONDS,
+        )
+    )
+
+    if (
+        etat_apres_login
+        != "connected"
     ):
         raise RuntimeError(
             "Connexion SGI non confirmée."
@@ -2233,17 +2489,170 @@ def signin(
         "Connexion SGI confirmée."
     )
 
+    return True
+
+
+def reconnecter_sgi(
+    driver,
+):
+    """
+    Reconnexion robuste après expiration volontaire de session SGI.
+
+    Ordre :
+      1. confirmer l'état actuel ;
+      2. si nécessaire, revenir à SGI_BASE_URL ;
+      3. tenter plusieurs authentifications ;
+      4. entre les tentatives, recharger proprement la page ;
+      5. ne lever une exception qu'après épuisement des tentatives.
+
+    Retour :
+      True  -> une reconnexion a été effectuée
+      False -> la session était déjà connectée
+    """
+
+    etat_initial = (
+        etat_session_sgi(
+            driver
+        )
+    )
+
+    if (
+        etat_initial
+        == "connected"
+    ):
+        return False
+
+    logger.warning(
+        "Session SGI non active | état=%s | lancement reconnexion.",
+        etat_initial,
+    )
+
+    derniere_erreur = None
+
+    for tentative in range(
+        1,
+        SGI_RECONNECT_MAX_ATTEMPTS
+        + 1,
+    ):
+
+        logger.info(
+            "Reconnexion SGI | tentative %s/%s.",
+            tentative,
+            SGI_RECONNECT_MAX_ATTEMPTS,
+        )
+
+        try:
+
+            etat = (
+                etat_session_sgi(
+                    driver
+                )
+            )
+
+            # État intermédiaire : revenir explicitement à l'accueil.
+            if (
+                SGI_FORCE_HOME_ON_DISCONNECT
+                and etat
+                != "login"
+            ):
+                etat = (
+                    ouvrir_page_connexion_sgi(
+                        driver
+                    )
+                )
+
+            if etat == "connected":
+
+                runtime_state[
+                    "sgi_reconnect_count"
+                ] += 1
+
+                runtime_state[
+                    "last_sgi_reconnect_at"
+                ] = maintenant_marche().isoformat()
+
+                logger.info(
+                    "Session SGI restaurée sans nouvelle saisie."
+                )
+
+                return True
+
+            signin(
+                driver
+            )
+
+            if (
+                etat_session_sgi(
+                    driver
+                )
+                == "connected"
+            ):
+
+                runtime_state[
+                    "sgi_reconnect_count"
+                ] += 1
+
+                runtime_state[
+                    "last_sgi_reconnect_at"
+                ] = maintenant_marche().isoformat()
+
+                logger.info(
+                    "Reconnexion SGI réussie | total=%s.",
+                    runtime_state[
+                        "sgi_reconnect_count"
+                    ],
+                )
+
+                return True
+
+        except Exception as exc:
+
+            derniere_erreur = (
+                exc
+            )
+
+            logger.warning(
+                "Tentative reconnexion SGI %s/%s échouée : %s",
+                tentative,
+                SGI_RECONNECT_MAX_ATTEMPTS,
+                exc,
+            )
+
+        if (
+            tentative
+            < SGI_RECONNECT_MAX_ATTEMPTS
+        ):
+
+            time_module.sleep(
+                SGI_RECONNECT_DELAY_SECONDS
+            )
+
+            # Nettoie uniquement la navigation/session web courante,
+            # sans tuer Chromium.
+            try:
+                ouvrir_page_connexion_sgi(
+                    driver
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Réouverture SGI intermédiaire échouée : %s",
+                    exc,
+                )
+
+    raise RuntimeError(
+        "Reconnexion SGI impossible après "
+        f"{SGI_RECONNECT_MAX_ATTEMPTS} tentative(s). "
+        f"Dernière erreur : {derniere_erreur}"
+    )
+
 
 def assurer_connexion_sgi(
     driver,
 ):
-    if est_connecte(
-        driver,
-        timeout=3,
-    ):
-        return
-
-    signin(
+    """
+    Retourne True lorsqu'une reconnexion a réellement eu lieu.
+    """
+    return reconnecter_sgi(
         driver
     )
 
@@ -2725,12 +3134,32 @@ def collecte(
             - dernier_check_session
             >= SESSION_CHECK_SECONDS
         ):
-            assurer_connexion_sgi(
-                driver
+            reconnexion_effectuee = (
+                assurer_connexion_sgi(
+                    driver
+                )
             )
 
+            if reconnexion_effectuee:
+                # Une nouvelle authentification doit disposer du même
+                # délai de grâce qu'une nouvelle session avant que le
+                # watchdog MarketDetails ne juge le flux silencieux.
+                collecte_started_epoch = (
+                    time_module.time()
+                )
+
+                dernier_market_event_epoch = (
+                    None
+                )
+
+                pending_marketdetails.clear()
+
+                logger.info(
+                    "Watchdog MarketDetails réinitialisé après reconnexion SGI."
+                )
+
             dernier_check_session = (
-                maintenant_epoch
+                time_module.time()
             )
 
         # -----------------------------------------------
@@ -3130,7 +3559,7 @@ def executer_session():
             driver,
             timeout=3,
         ):
-            signin(
+            reconnecter_sgi(
                 driver
             )
 

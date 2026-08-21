@@ -309,6 +309,47 @@ STORAGE_CHECK_INTERVAL_SECONDS = int(
 
 
 # ============================================================
+# FILTRE DE QUALITE AVANT INSERTION AIVEN
+# ============================================================
+#
+# Une ligne est rejetée AVANT INSERT si elle contient au moins
+# ROW_REJECT_NULL_COUNT valeurs manquantes parmi les champs de marché
+# contrôlés ci-dessous.
+FILTER_LOW_QUALITY_ROWS = (
+    os.getenv(
+        "FILTER_LOW_QUALITY_ROWS",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+ROW_REJECT_NULL_COUNT = int(
+    os.getenv(
+        "ROW_REJECT_NULL_COUNT",
+        "10",
+    )
+)
+
+# En plus du nombre de NULL, une ligne doit présenter au moins une
+# vraie valeur dans les principaux champs de marché.
+REQUIRE_CORE_MARKET_VALUE = (
+    os.getenv(
+        "REQUIRE_CORE_MARKET_VALUE",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+LOG_REJECTED_ROW_DETAILS = (
+    os.getenv(
+        "LOG_REJECTED_ROW_DETAILS",
+        "false",
+    ).strip().lower()
+    in {"1", "true", "yes", "oui"}
+)
+
+
+# ============================================================
 # 7. LIMITES MEMOIRE
 # ============================================================
 
@@ -435,6 +476,10 @@ runtime_state = {
     "market_bodies_ignored": 0,
     "market_body_errors": 0,
     "rows_inserted": 0,
+    "rows_rejected_low_quality": 0,
+    "last_snapshot_candidates": 0,
+    "last_snapshot_inserted": 0,
+    "last_snapshot_rejected": 0,
     "last_market_event_at": None,
     "last_insert_at": None,
     "memory_tree_rss_mb": None,
@@ -513,6 +558,12 @@ def verifier_configuration():
     ):
         raise RuntimeError(
             "Nom de table Aiven invalide."
+        )
+
+
+    if ROW_REJECT_NULL_COUNT < 1:
+        raise RuntimeError(
+            "ROW_REJECT_NULL_COUNT doit être >= 1."
         )
 
     ca_path = Path(
@@ -642,7 +693,168 @@ def convertir_json(
 
 
 # ============================================================
-# 13. AIVEN MYSQL
+# 13. PRE-ANALYSE QUALITE DES LIGNES
+# ============================================================
+
+# Ces champs correspondent aux colonnes métier susceptibles d'être NULL.
+# mnemonique et collected_at ne sont volontairement pas comptés.
+QUALITY_FIELDS = (
+    "nom",
+    "code_isin",
+    "seuil_bas",
+    "seuil_haut",
+    "valeur_cmp",
+    "cours_veille",
+    "carnet_ordres",
+    "dernier_cours",
+    "groupe_marche",
+    "cours_max_jour",
+    "cours_min_jour",
+    "cours_ouverture",
+    "valeur_echangee",
+    "quantite_echangee",
+    "statut_suspension",
+    "variation_montant",
+    "info_dernier_echange",
+    "variation_pourcentage",
+    "heure_derniere_execution",
+    "prix_theorique_ouverture",
+    "quantite_dernier_echange",
+    "quantite_theorique_ouverture",
+    "horodatage_derniere_execution",
+    "variation_theorique_ouverture",
+)
+
+# Une ligne peut avoir des champs optionnels vides tout en restant utile.
+# Elle doit néanmoins contenir au moins une valeur de marché principale.
+CORE_MARKET_FIELDS = (
+    "cours_veille",
+    "dernier_cours",
+    "cours_max_jour",
+    "cours_min_jour",
+    "cours_ouverture",
+    "valeur_echangee",
+    "quantite_echangee",
+    "seuil_bas",
+    "seuil_haut",
+    "valeur_cmp",
+    "prix_theorique_ouverture",
+)
+
+
+def est_valeur_manquante(
+    value,
+):
+    if value is None:
+        return True
+
+    if isinstance(
+        value,
+        str,
+    ):
+        texte = value.strip()
+
+        if not texte:
+            return True
+
+        if texte.lower() in {
+            "none",
+            "null",
+            "nan",
+            "n/a",
+            "na",
+            "-",
+        }:
+            return True
+
+        return False
+
+    if isinstance(
+        value,
+        (list, tuple, dict, set),
+    ):
+        return len(
+            value
+        ) == 0
+
+    return False
+
+
+def analyser_qualite_ligne(
+    valeurs,
+):
+    """
+    Analyse une ligne APRES conversion vers les types Aiven,
+    mais AVANT l'INSERT SQL.
+
+    Retourne :
+      {
+        "accepter": bool,
+        "null_count": int,
+        "non_null_count": int,
+        "core_value_count": int,
+        "missing_fields": [...]
+      }
+    """
+
+    missing_fields = [
+        champ
+        for champ in QUALITY_FIELDS
+        if est_valeur_manquante(
+            valeurs.get(
+                champ
+            )
+        )
+    ]
+
+    null_count = len(
+        missing_fields
+    )
+
+    non_null_count = (
+        len(
+            QUALITY_FIELDS
+        )
+        - null_count
+    )
+
+    core_value_count = sum(
+        1
+        for champ in CORE_MARKET_FIELDS
+        if not est_valeur_manquante(
+            valeurs.get(
+                champ
+            )
+        )
+    )
+
+    accepter = True
+
+    if (
+        FILTER_LOW_QUALITY_ROWS
+        and null_count
+        >= ROW_REJECT_NULL_COUNT
+    ):
+        accepter = False
+
+    if (
+        FILTER_LOW_QUALITY_ROWS
+        and REQUIRE_CORE_MARKET_VALUE
+        and core_value_count == 0
+    ):
+        accepter = False
+
+    return {
+        "accepter": accepter,
+        "null_count": null_count,
+        "non_null_count": non_null_count,
+        "core_value_count": core_value_count,
+        "missing_fields": missing_fields,
+    }
+
+
+# ============================================================
+# 14. AIVEN MYSQL
 # ============================================================
 
 class AivenMySQLClient:
@@ -912,13 +1124,19 @@ class AivenMySQLClient:
         donnees_marche,
     ):
         """
-        Fidèle à la logique locale :
-        chaque réponse MarketDetails valide déclenche l'insertion
-        du snapshot courant complet.
+        Pré-analyse chaque ligne avant INSERT.
 
-        On ne fait PAS de déduplication entre deux réponses,
-        parce que le scraper local appelle Collecte_data_BRVM()
-        à chaque réponse MarketDetails.
+        Règles :
+        - les métadonnées sont ignorées ;
+        - mnemonique obligatoire ;
+        - conversion vers les types Aiven ;
+        - comptage des valeurs manquantes ;
+        - rejet des lignes trop creuses ;
+        - seules les lignes suffisamment renseignées sont insérées.
+
+        IMPORTANT :
+        le cache de marché n'est PAS supprimé/modifié par ce filtre.
+        Seule l'écriture Aiven est filtrée.
         """
 
         self.check_storage_limit()
@@ -977,6 +1195,8 @@ class AivenMySQLClient:
         """
 
         lignes = []
+        lignes_rejetees = []
+        candidats = 0
 
         for (
             cle,
@@ -996,6 +1216,8 @@ class AivenMySQLClient:
             ):
                 continue
 
+            candidats += 1
+
             mnemonique = (
                 convertir_texte(
                     data.get(
@@ -1007,98 +1229,263 @@ class AivenMySQLClient:
             )
 
             if not mnemonique:
+                lignes_rejetees.append(
+                    {
+                        "mnemonique": str(
+                            cle
+                        ),
+                        "reason": "mnemonique_absent",
+                        "null_count": None,
+                        "missing_fields": [],
+                    }
+                )
                 continue
 
-            lignes.append(
-                (
-                    convertir_texte(
-                        data.get("nom"),
-                        255,
+            # ------------------------------------------------
+            # Conversion AVANT pré-analyse
+            # ------------------------------------------------
+
+            valeurs = {
+                "nom": convertir_texte(
+                    data.get("nom"),
+                    255,
+                ),
+                "code_isin": convertir_texte(
+                    data.get("code_isin"),
+                    64,
+                ),
+                "seuil_bas": convertir_decimal(
+                    data.get("seuil_bas")
+                ),
+                "mnemonique": mnemonique,
+                "seuil_haut": convertir_decimal(
+                    data.get("seuil_haut")
+                ),
+                "valeur_cmp": convertir_decimal(
+                    data.get("valeur_cmp")
+                ),
+                "cours_veille": convertir_decimal(
+                    data.get("cours_veille")
+                ),
+                "carnet_ordres": (
+                    data.get(
+                        "carnet_ordres",
+                        [],
+                    )
+                    or []
+                ),
+                "dernier_cours": convertir_decimal(
+                    data.get("dernier_cours")
+                ),
+                "groupe_marche": convertir_texte(
+                    data.get("groupe_marche"),
+                    64,
+                ),
+                "cours_max_jour": convertir_decimal(
+                    data.get("cours_max_jour")
+                ),
+                "cours_min_jour": convertir_decimal(
+                    data.get("cours_min_jour")
+                ),
+                "cours_ouverture": convertir_decimal(
+                    data.get("cours_ouverture")
+                ),
+                "valeur_echangee": convertir_decimal(
+                    data.get("valeur_echangee")
+                ),
+                "quantite_echangee": convertir_entier(
+                    data.get("quantite_echangee")
+                ),
+                "statut_suspension": convertir_texte(
+                    data.get(
+                        "statut_suspension"
                     ),
-                    convertir_texte(
-                        data.get("code_isin"),
-                        64,
+                    255,
+                ),
+                "variation_montant": convertir_decimal(
+                    data.get(
+                        "variation_montant"
+                    )
+                ),
+                "info_dernier_echange": convertir_texte(
+                    data.get(
+                        "info_dernier_echange"
                     ),
-                    convertir_decimal(
-                        data.get("seuil_bas")
+                    255,
+                ),
+                "variation_pourcentage": convertir_decimal(
+                    data.get(
+                        "variation_pourcentage"
+                    )
+                ),
+                "heure_derniere_execution": convertir_texte(
+                    data.get(
+                        "heure_derniere_execution"
                     ),
-                    mnemonique,
-                    convertir_decimal(
-                        data.get("seuil_haut")
+                    64,
+                ),
+                "prix_theorique_ouverture": convertir_decimal(
+                    data.get(
+                        "prix_theorique_ouverture"
+                    )
+                ),
+                "quantite_dernier_echange": convertir_entier(
+                    data.get(
+                        "quantite_dernier_echange"
+                    )
+                ),
+                "quantite_theorique_ouverture": convertir_entier(
+                    data.get(
+                        "quantite_theorique_ouverture"
+                    )
+                ),
+                "horodatage_derniere_execution": convertir_texte(
+                    data.get(
+                        "horodatage_derniere_execution"
                     ),
-                    convertir_decimal(
-                        data.get("valeur_cmp")
-                    ),
-                    convertir_decimal(
-                        data.get("cours_veille")
-                    ),
-                    convertir_json(
-                        data.get(
-                            "carnet_ordres",
-                            [],
-                        )
-                    ),
-                    convertir_decimal(
-                        data.get("dernier_cours")
-                    ),
-                    convertir_texte(
-                        data.get("groupe_marche"),
-                        64,
-                    ),
-                    convertir_decimal(
-                        data.get("cours_max_jour")
-                    ),
-                    convertir_decimal(
-                        data.get("cours_min_jour")
-                    ),
-                    convertir_decimal(
-                        data.get("cours_ouverture")
-                    ),
-                    convertir_decimal(
-                        data.get("valeur_echangee")
-                    ),
-                    convertir_entier(
-                        data.get("quantite_echangee")
-                    ),
-                    convertir_texte(
-                        data.get("statut_suspension"),
-                        255,
-                    ),
-                    convertir_decimal(
-                        data.get("variation_montant")
-                    ),
-                    convertir_texte(
-                        data.get("info_dernier_echange"),
-                        255,
-                    ),
-                    convertir_decimal(
-                        data.get("variation_pourcentage")
-                    ),
-                    convertir_texte(
-                        data.get("heure_derniere_execution"),
-                        64,
-                    ),
-                    convertir_decimal(
-                        data.get("prix_theorique_ouverture")
-                    ),
-                    convertir_entier(
-                        data.get("quantite_dernier_echange")
-                    ),
-                    convertir_entier(
-                        data.get("quantite_theorique_ouverture")
-                    ),
-                    convertir_texte(
-                        data.get("horodatage_derniere_execution"),
-                        128,
-                    ),
-                    convertir_decimal(
-                        data.get("variation_theorique_ouverture")
-                    ),
-                    collected_at,
+                    128,
+                ),
+                "variation_theorique_ouverture": convertir_decimal(
+                    data.get(
+                        "variation_theorique_ouverture"
+                    )
+                ),
+                "collected_at": collected_at,
+            }
+
+            qualite = (
+                analyser_qualite_ligne(
+                    valeurs
                 )
             )
 
+            if not qualite[
+                "accepter"
+            ]:
+                lignes_rejetees.append(
+                    {
+                        "mnemonique": mnemonique,
+                        "reason": "qualite_insuffisante",
+                        "null_count": qualite[
+                            "null_count"
+                        ],
+                        "core_value_count": qualite[
+                            "core_value_count"
+                        ],
+                        "missing_fields": qualite[
+                            "missing_fields"
+                        ],
+                    }
+                )
+                continue
+
+            # ------------------------------------------------
+            # Ligne SQL acceptée
+            # ------------------------------------------------
+
+            lignes.append(
+                (
+                    valeurs["nom"],
+                    valeurs["code_isin"],
+                    valeurs["seuil_bas"],
+                    valeurs["mnemonique"],
+                    valeurs["seuil_haut"],
+                    valeurs["valeur_cmp"],
+                    valeurs["cours_veille"],
+                    convertir_json(
+                        valeurs["carnet_ordres"]
+                    ),
+                    valeurs["dernier_cours"],
+                    valeurs["groupe_marche"],
+                    valeurs["cours_max_jour"],
+                    valeurs["cours_min_jour"],
+                    valeurs["cours_ouverture"],
+                    valeurs["valeur_echangee"],
+                    valeurs["quantite_echangee"],
+                    valeurs["statut_suspension"],
+                    valeurs["variation_montant"],
+                    valeurs["info_dernier_echange"],
+                    valeurs["variation_pourcentage"],
+                    valeurs["heure_derniere_execution"],
+                    valeurs["prix_theorique_ouverture"],
+                    valeurs["quantite_dernier_echange"],
+                    valeurs["quantite_theorique_ouverture"],
+                    valeurs["horodatage_derniere_execution"],
+                    valeurs["variation_theorique_ouverture"],
+                    valeurs["collected_at"],
+                )
+            )
+
+        rejetes = len(
+            lignes_rejetees
+        )
+
+        runtime_state[
+            "last_snapshot_candidates"
+        ] = candidats
+
+        runtime_state[
+            "last_snapshot_inserted"
+        ] = len(
+            lignes
+        )
+
+        runtime_state[
+            "last_snapshot_rejected"
+        ] = rejetes
+
+        runtime_state[
+            "rows_rejected_low_quality"
+        ] += rejetes
+
+        # ----------------------------------------------------
+        # Résumé de pré-analyse
+        # ----------------------------------------------------
+
+        logger.info(
+            "Pré-analyse qualité | candidats=%s | "
+            "acceptés=%s | rejetés=%s | "
+            "seuil_rejet=NULL>=%s",
+            candidats,
+            len(
+                lignes
+            ),
+            rejetes,
+            ROW_REJECT_NULL_COUNT,
+        )
+
+        if (
+            LOG_REJECTED_ROW_DETAILS
+            and lignes_rejetees
+        ):
+            for rejet in lignes_rejetees[
+                :20
+            ]:
+                logger.info(
+                    "Ligne rejetée | mnemonique=%s | "
+                    "nulls=%s | core=%s | champs_manquants=%s",
+                    rejet.get(
+                        "mnemonique"
+                    ),
+                    rejet.get(
+                        "null_count"
+                    ),
+                    rejet.get(
+                        "core_value_count"
+                    ),
+                    ",".join(
+                        rejet.get(
+                            "missing_fields",
+                            [],
+                        )
+                    ),
+                )
+
         if not lignes:
+            logger.warning(
+                "Aucune ligne suffisamment renseignée à insérer "
+                "dans ce snapshot."
+            )
             return 0
 
         try:
@@ -1127,7 +1514,7 @@ class AivenMySQLClient:
         ).isoformat()
 
         logger.info(
-            "%s ligne(s) enregistrée(s) dans Aiven.",
+            "%s ligne(s) qualifiée(s) enregistrée(s) dans Aiven.",
             len(
                 lignes
             ),
@@ -1136,6 +1523,7 @@ class AivenMySQLClient:
         return len(
             lignes
         )
+
 
     def close(
         self,

@@ -239,6 +239,16 @@ SESSION_CHECK_SECONDS = int(
     )
 )
 
+
+# Diagnostic périodique de la page Chromium.
+# Permet de vérifier si Chrome considère la page SGI comme visible/active.
+BROWSER_HEALTH_CHECK_SECONDS = int(
+    os.getenv(
+        "BROWSER_HEALTH_CHECK_SECONDS",
+        "60",
+    )
+)
+
 # Le code local appelle getResponseBody immédiatement.
 # Sur Render, le serveur peut être légèrement plus lent.
 # Ces retries gardent la logique locale tout en la fiabilisant.
@@ -1337,6 +1347,53 @@ def creer_driver():
         "--window-size=1920,1080"
     )
 
+
+    # --------------------------------------------------------
+    # IMPORTANT POUR LE FLUX SGI
+    # --------------------------------------------------------
+    # Le site semble utiliser des timers JavaScript pour continuer
+    # à demander MarketDetails.aspx. En mode headless, Chromium peut
+    # considérer la page comme masquée et ralentir fortement ces timers.
+    #
+    # Ces flags empêchent le renderer et les timers de passer en mode
+    # arrière-plan.
+    options.add_argument(
+        "--disable-background-timer-throttling"
+    )
+
+    options.add_argument(
+        "--disable-backgrounding-occluded-windows"
+    )
+
+    options.add_argument(
+        "--disable-renderer-backgrounding"
+    )
+
+    options.add_argument(
+        "--disable-features=IntensiveWakeUpThrottling"
+    )
+
+    # Allège Chromium sur l'instance Render Free.
+    options.add_argument(
+        "--disable-gpu"
+    )
+
+    options.add_argument(
+        "--disable-extensions"
+    )
+
+    options.add_argument(
+        "--no-first-run"
+    )
+
+    options.add_argument(
+        "--disable-default-apps"
+    )
+
+    options.add_argument(
+        "--disable-notifications"
+    )
+
     options.add_experimental_option(
         "excludeSwitches",
         ["enable-automation"],
@@ -1381,7 +1438,71 @@ def creer_driver():
 
 
 # ============================================================
-# 18. CONNEXION SGI
+# 18. MAINTIEN DE LA PAGE CHROMIUM ACTIVE
+# ============================================================
+
+def maintenir_page_chrome_active(
+    driver,
+):
+    """
+    Tente de maintenir l'onglet SGI au premier plan du contexte Chrome.
+
+    Page.bringToFront ne recharge pas la page et ne modifie pas la
+    session SGI.
+    """
+    try:
+        driver.execute_cdp_cmd(
+            "Page.bringToFront",
+            {},
+        )
+        return True
+
+    except Exception as exc:
+        logger.debug(
+            "Page.bringToFront indisponible : %s",
+            exc,
+        )
+        return False
+
+
+def diagnostic_page_chrome(
+    driver,
+):
+    """
+    Retourne l'état que Chromium attribue à la page SGI.
+    """
+    try:
+        etat = driver.execute_script(
+            """
+            return {
+                hidden: document.hidden,
+                visibilityState: document.visibilityState,
+                readyState: document.readyState,
+                title: document.title
+            };
+            """
+        )
+
+        if not isinstance(
+            etat,
+            dict,
+        ):
+            etat = {}
+
+        etat[
+            "url"
+        ] = driver.current_url
+
+        return etat
+
+    except Exception as exc:
+        return {
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# 19. CONNEXION SGI
 # ============================================================
 
 XPATH_CONNECTE = (
@@ -1414,6 +1535,10 @@ def start_sgi(
 
     driver.get(
         SGI_BASE_URL
+    )
+
+    maintenir_page_chrome_active(
+        driver
     )
 
 
@@ -1499,6 +1624,10 @@ def signin(
             "Connexion SGI non confirmée."
         )
 
+    maintenir_page_chrome_active(
+        driver
+    )
+
     logger.info(
         "Connexion SGI confirmée."
     )
@@ -1519,7 +1648,7 @@ def assurer_connexion_sgi(
 
 
 # ============================================================
-# 19. GET RESPONSE BODY — LOGIQUE LOCALE + RETRIES RENDER
+# 20. GET RESPONSE BODY — LOGIQUE LOCALE + RETRIES RENDER
 # ============================================================
 
 def get_response_body_once(
@@ -1608,7 +1737,7 @@ def get_response_body(
 
 
 # ============================================================
-# 20. LIMITATION DES HISTORIQUES EN RAM
+# 21. LIMITATION DES HISTORIQUES EN RAM
 # ============================================================
 
 def limiter_historique(
@@ -1663,7 +1792,7 @@ def nettoyer_historiques_ram():
 
 
 # ============================================================
-# 21. CLASSIFICATION DES REPONSES MARKETDETAILS
+# 22. CLASSIFICATION DES REPONSES MARKETDETAILS
 # ============================================================
 
 def classifier_marketdetails_body(
@@ -1826,7 +1955,7 @@ def journaliser_body_anormal(
 
 
 # ============================================================
-# 22. TRAITEMENT D'UNE REPONSE MKT
+# 23. TRAITEMENT D'UNE REPONSE MKT
 # ============================================================
 
 def traiter_marketdetails_body(
@@ -1911,7 +2040,7 @@ def traiter_marketdetails_body(
 
 
 # ============================================================
-# 22. COLLECTE — CALQUEE SUR brvmscraping1.py
+# 24. COLLECTE — CALQUEE SUR brvmscraping1.py
 # ============================================================
 
 def collecte(
@@ -1930,6 +2059,7 @@ def collecte(
     )
 
     dernier_check_session = 0.0
+    dernier_check_browser = 0.0
 
     # Fallback :
     # si responseReceived arrive un peu avant que le body soit
@@ -1989,6 +2119,51 @@ def collecte(
             )
 
             dernier_check_session = (
+                maintenant_epoch
+            )
+
+        # -----------------------------------------------
+        # Maintien / diagnostic Chromium
+        # -----------------------------------------------
+
+        if (
+            maintenant_epoch
+            - dernier_check_browser
+            >= BROWSER_HEALTH_CHECK_SECONDS
+        ):
+            maintenir_page_chrome_active(
+                driver
+            )
+
+            etat_chrome = (
+                diagnostic_page_chrome(
+                    driver
+                )
+            )
+
+            last_event_iso = runtime_state.get(
+                "last_market_event_at"
+            )
+
+            logger.info(
+                "Chrome SGI actif | visibility=%s | hidden=%s | "
+                "readyState=%s | URL=%s | dernier_event=%s",
+                etat_chrome.get(
+                    "visibilityState"
+                ),
+                etat_chrome.get(
+                    "hidden"
+                ),
+                etat_chrome.get(
+                    "readyState"
+                ),
+                etat_chrome.get(
+                    "url"
+                ),
+                last_event_iso,
+            )
+
+            dernier_check_browser = (
                 maintenant_epoch
             )
 
@@ -2240,7 +2415,7 @@ def collecte(
 
 
 # ============================================================
-# 23. SESSION CHROME
+# 25. SESSION CHROME
 # ============================================================
 
 def executer_session():
@@ -2286,7 +2461,7 @@ def executer_session():
 
 
 # ============================================================
-# 24. MAIN RENDER
+# 26. MAIN RENDER
 # ============================================================
 
 def main():
@@ -2347,7 +2522,6 @@ def main():
             ] = str(
                 exc
             )
-            
 
             logger.critical(
                 "%s",
@@ -2397,7 +2571,7 @@ def main():
 
 
 # ============================================================
-# 25. POINT D'ENTREE
+# 27. POINT D'ENTREE
 # ============================================================
 
 if __name__ == "__main__":
